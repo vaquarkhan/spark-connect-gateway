@@ -1,0 +1,26 @@
+[package]
+name = "scg-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-genproto = { path = "../genproto" }
+scg-routing = { path = "../routing" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+prost = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+scg-store-memory = { path = "../store-memory" }
+scg-pool-static = { path = "../pool-static" }
+tokio = { workspace = true }
+async-stream = "0.3"

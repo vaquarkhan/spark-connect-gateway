@@ -1,0 +1,24 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+scg-config = { path = "../config" }
+scg-genproto = { path = "../genproto" }
+scg-pool-static = { path = "../pool-static" }
+scg-proxy = { path = "../proxy" }
+scg-routing = { path = "../routing" }
+scg-store-memory = { path = "../store-memory" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gateway",
+    "crates/proxy",
+    "crates/routing",
+    "crates/store-memory",
+    "crates/pool-static",
+    "crates/config",
+    "crates/genproto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/liangchi-hsieh/spark-connect-gateway"
+publish = false
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Async + gRPC
+tokio = { version = "1.41", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tower = "0.5"
+prost = "0.14"
+prost-types = "0.14"
+
+# Logging + telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config + utilities
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+parking_lot = "0.12"
+
+# Test-only
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

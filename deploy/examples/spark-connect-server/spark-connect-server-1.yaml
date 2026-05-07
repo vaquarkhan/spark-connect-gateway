@@ -1,0 +1,21 @@
+apiVersion: spark.apache.org/v1alpha1
+kind: SparkConnectServer
+metadata:
+  name: spark-connect-1
+  namespace: spark-connect
+  labels:
+    app: spark-connect
+    instance: "1"
+spec:
+  sparkVersion: "4.0.0"
+  image: "apache/spark:4.0.0"
+  driver:
+    cores: 1
+    memory: "1g"
+    serviceAccount: spark
+  executor:
+    cores: 1
+    memory: "1g"
+    instances: 2
+  sparkConf:
+    spark.connect.grpc.binding.port: "15002"

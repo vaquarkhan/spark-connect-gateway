@@ -1,0 +1,10 @@
+[package]
+name = "scg-pool-static"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-routing = { path = "../routing" }
+thiserror = { workspace = true }

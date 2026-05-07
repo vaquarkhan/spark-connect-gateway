@@ -1,0 +1,10 @@
+[package]
+name = "scg-store-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-routing = { path = "../routing" }
+parking_lot = { workspace = true }
