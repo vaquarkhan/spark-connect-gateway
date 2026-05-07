@@ -42,6 +42,14 @@ fn key_from(session_id: &str, uc: Option<&pb::UserContext>) -> SessionKey {
     SessionKey::new(uc.map(|u| u.user_id.as_str()).unwrap_or(""), session_id)
 }
 
+/// Convert a possibly-empty backend selection into an `Unavailable` Status.
+/// A None is most commonly produced when a dynamic pool (Phase 2 K8s
+/// service-watch) hasn't seen any healthy endpoint yet, e.g. during
+/// gateway boot before the watcher's initial list event.
+fn require_addr(addr: Option<String>) -> Result<String, Status> {
+    addr.ok_or_else(|| Status::unavailable("no healthy backend available"))
+}
+
 /// Forward a tonic streaming response to a fresh server-stream sent through
 /// `tx`. We don't pipe directly to the inbound `Streaming` because we need
 /// to return early on the first error and report it as a Status.
@@ -61,7 +69,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::AnalyzePlanResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.analyze_plan(Request::new(body)).await
     }
@@ -72,7 +80,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ConfigResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.config(Request::new(body)).await
     }
@@ -83,7 +91,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ArtifactStatusesResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.artifact_status(Request::new(body)).await
     }
@@ -100,7 +108,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             Some(pb::interrupt_request::Interrupt::OperationId(id)) => id.clone(),
             _ => String::new(),
         };
-        let addr = self.router.resolve_op(&op_id, &key);
+        let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
         let mut c = self.client(&addr)?;
         c.interrupt(Request::new(body)).await
     }
@@ -112,7 +120,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
         let op_id = body.operation_id.clone();
-        let addr = self.router.resolve_op(&op_id, &key);
+        let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
         let mut c = self.client(&addr)?;
         let resp = c.release_execute(Request::new(body)).await?;
         // On a successful release the server has dropped the operation, so
@@ -127,7 +135,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ReleaseSessionResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         let resp = c.release_session(Request::new(body)).await?;
         self.router.forget_session(&key);
@@ -140,7 +148,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::FetchErrorDetailsResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.fetch_error_details(Request::new(body)).await
     }
@@ -151,7 +159,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::CloneSessionResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.clone_session(Request::new(body)).await
     }
@@ -162,7 +170,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.get_status(Request::new(body)).await
     }
@@ -175,7 +183,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<Self::ExecutePlanStream>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
 
         // Bind operation_id → backend so a follow-up ReattachExecute reaches
         // the same driver even if its session id is missing or has been
@@ -197,7 +205,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<Self::ReattachExecuteStream>, Status> {
         let body = req.into_inner();
         let key = key_from(&body.session_id, body.user_context.as_ref());
-        let addr = self.router.resolve_op(&body.operation_id, &key);
+        let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
         let mut c = self.client(&addr)?;
         let upstream = c.reattach_execute(Request::new(body)).await?.into_inner();
         Ok(Response::new(forward_server_stream(upstream)))
@@ -219,7 +227,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             .ok_or_else(|| Status::invalid_argument("AddArtifacts: empty client stream"))?;
 
         let key = key_from(&first.session_id, first.user_context.as_ref());
-        let addr = self.router.resolve_session(&key);
+        let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<pb::AddArtifactsRequest>(8);

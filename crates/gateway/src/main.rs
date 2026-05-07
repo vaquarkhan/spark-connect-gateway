@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use scg_config::Config;
+use scg_config::{BackendDiscovery, Config};
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
+use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
 use scg_routing::{AffinityStore, Pool, Router};
@@ -29,15 +30,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = Config::load(&args.config).with_context(|| format!("loading {}", args.config))?;
 
-    let pool: Arc<dyn Pool> =
-        Arc::new(StaticPool::new(cfg.backends.clone()).context("building static pool")?);
+    let (pool, _watcher) = build_pool(&cfg.discovery).await?;
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
     let router = Arc::new(Router::new(pool, store));
     let dialer = Dialer::new();
     let svc = SparkConnectProxy::new(router, dialer);
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
-    info!(version = env!("CARGO_PKG_VERSION"), %addr, backends = ?cfg.backends, "spark-connect-gateway starting");
+    log_startup(&cfg, &addr);
 
     Server::builder()
         .add_service(SparkConnectServiceServer::new(svc))
@@ -47,6 +47,67 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Build the configured `Pool` implementation. For dynamic sources
+/// (K8s) the watcher task is spawned and its `JoinHandle` is returned
+/// so the caller can keep it alive for the lifetime of the server.
+async fn build_pool(
+    discovery: &BackendDiscovery,
+) -> Result<(Arc<dyn Pool>, Option<tokio::task::JoinHandle<()>>)> {
+    match discovery {
+        BackendDiscovery::Static { addresses } => {
+            let pool = StaticPool::new(addresses.clone()).context("building static pool")?;
+            Ok((Arc::new(pool), None))
+        }
+        BackendDiscovery::K8s {
+            namespace,
+            service_name,
+            port,
+        } => {
+            let pool = K8sPool::new();
+            let cfg = K8sPoolConfig {
+                namespace: namespace.clone(),
+                service_name: service_name.clone(),
+                port: *port,
+            };
+            let handle = pool
+                .spawn_watcher(cfg)
+                .await
+                .context("spawning K8s Endpoints watcher")?;
+            Ok((Arc::new(pool), Some(handle)))
+        }
+    }
+}
+
+fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
+    let version = env!("CARGO_PKG_VERSION");
+    match &cfg.discovery {
+        BackendDiscovery::Static { addresses } => {
+            info!(
+                version,
+                %addr,
+                discovery = "static",
+                backends = ?addresses,
+                "spark-connect-gateway starting"
+            );
+        }
+        BackendDiscovery::K8s {
+            namespace,
+            service_name,
+            port,
+        } => {
+            info!(
+                version,
+                %addr,
+                discovery = "k8s",
+                namespace = %namespace,
+                service = %service_name,
+                port,
+                "spark-connect-gateway starting (will populate backends from K8s Endpoints)"
+            );
+        }
+    }
 }
 
 fn parse_bind_addr(s: &str) -> Result<std::net::SocketAddr> {

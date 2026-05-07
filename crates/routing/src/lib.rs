@@ -37,8 +37,26 @@ impl SessionKey {
 }
 
 /// Selects backends. Implementations must be safe for concurrent use.
+///
+/// Phase 1 had a single static implementation that always returned a
+/// backend. Phase 2 introduces dynamic pools (K8s service-watch) where
+/// the pool can be empty during startup or after a flap, so `pick`
+/// returns `Option<String>`.
 pub trait Pool: Send + Sync + 'static {
-    fn pick(&self) -> String;
+    /// Pick the next backend for a *new* session, or `None` if no healthy
+    /// backend is currently available. Must be safe for concurrent use;
+    /// implementations typically advance an internal cursor.
+    fn pick(&self) -> Option<String>;
+
+    /// Snapshot of currently-healthy backend addresses. Used by metrics
+    /// and admin endpoints. Order is implementation-defined.
+    fn all_healthy(&self) -> Vec<String>;
+
+    /// Best-effort hint that `addr` is unreachable. Implementations may
+    /// remove `addr` from the rotation, decrement a health score, or
+    /// ignore the hint entirely. Phase 2 K8s pools use this for passive
+    /// failure detection alongside their active service-watch.
+    fn mark_unhealthy(&self, _addr: &str) {}
 }
 
 /// Persistence layer for sticky routing decisions. Phase 1 ships an
@@ -67,20 +85,23 @@ impl Router {
     }
 
     /// Resolve a backend for `key`. If a binding exists it is returned;
-    /// otherwise a fresh backend is picked, recorded, and returned.
+    /// otherwise a fresh backend is picked from the pool, recorded, and
+    /// returned. Returns `None` only when no binding exists *and* the
+    /// pool currently has no healthy backend (e.g. K8s service-watch
+    /// pool during startup).
     ///
     /// A `SessionKey` with an empty `session_id` falls through to a fresh
     /// pick, but that binding is *not* recorded — without a stable session
     /// id we cannot honour stickiness on the next call.
-    pub fn resolve_session(&self, key: &SessionKey) -> String {
+    pub fn resolve_session(&self, key: &SessionKey) -> Option<String> {
         if key.is_zero() {
             return self.pool.pick();
         }
         if let Some(existing) = self.store.lookup_session(key) {
-            return existing;
+            return Some(existing);
         }
-        let chosen = self.pool.pick();
-        self.store.bind_session_if_absent(key.clone(), chosen)
+        let chosen = self.pool.pick()?;
+        Some(self.store.bind_session_if_absent(key.clone(), chosen))
     }
 
     /// Resolve a backend for an operation, falling back to session routing
@@ -91,13 +112,18 @@ impl Router {
     /// specific backend, and the gateway must route back to that same
     /// backend even if the affinity cache for the session has already
     /// expired or is missing.
-    pub fn resolve_op(&self, op_id: &str, key: &SessionKey) -> String {
+    pub fn resolve_op(&self, op_id: &str, key: &SessionKey) -> Option<String> {
         if !op_id.is_empty() {
             if let Some(b) = self.store.lookup_op(op_id) {
-                return b;
+                return Some(b);
             }
         }
         self.resolve_session(key)
+    }
+
+    /// Hint to the pool that `addr` is currently unreachable.
+    pub fn mark_unhealthy(&self, addr: &str) {
+        self.pool.mark_unhealthy(addr);
     }
 
     pub fn remember_op(&self, op_id: String, backend: String) {
@@ -130,9 +156,24 @@ mod tests {
         n: AtomicU64,
     }
     impl Pool for SeqPool {
-        fn pick(&self) -> String {
+        fn pick(&self) -> Option<String> {
             let i = self.n.fetch_add(1, Ordering::SeqCst);
-            ["a", "b", "c"][(i % 3) as usize].to_string()
+            Some(["a", "b", "c"][(i % 3) as usize].to_string())
+        }
+        fn all_healthy(&self) -> Vec<String> {
+            vec!["a".into(), "b".into(), "c".into()]
+        }
+    }
+
+    /// Pool that always reports empty — used to test the "no backend"
+    /// path through Router::resolve_session.
+    struct EmptyPool;
+    impl Pool for EmptyPool {
+        fn pick(&self) -> Option<String> {
+            None
+        }
+        fn all_healthy(&self) -> Vec<String> {
+            Vec::new()
         }
     }
 
@@ -218,6 +259,14 @@ mod tests {
         let k = SessionKey::new("u", "s");
         let _first = r.resolve_op("op-unknown", &k);
         r.remember_op("op-1".to_string(), "explicit:1".to_string());
-        assert_eq!(r.resolve_op("op-1", &k), "explicit:1");
+        assert_eq!(r.resolve_op("op-1", &k).as_deref(), Some("explicit:1"));
+    }
+
+    #[test]
+    fn empty_pool_returns_none() {
+        let r = Router::new(Arc::new(EmptyPool), Arc::new(StubStore::default()));
+        let k = SessionKey::new("u", "s");
+        assert!(r.resolve_session(&k).is_none());
+        assert!(r.resolve_op("op", &k).is_none());
     }
 }

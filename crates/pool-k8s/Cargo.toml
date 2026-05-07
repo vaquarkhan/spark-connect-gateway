@@ -1,0 +1,19 @@
+[package]
+name = "scg-pool-k8s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-routing = { path = "../routing" }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }

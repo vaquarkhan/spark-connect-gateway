@@ -1,8 +1,17 @@
 # Address the gateway will bind to. Default :15003 (0.0.0.0:15003).
 bind_addr: ":15003"
 
-# Static list of Spark Connect server backends. Phase 1 only — Phase 2 adds
-# dynamic K8s service-watch and Consul-backed pools.
+# Static list of Spark Connect server backends. Phase 1 shorthand —
+# equivalent to `backend_discovery: { type: static, addresses: [...] }`.
 backends:
   - "spark-connect-1.svc.cluster.local:15002"
   - "spark-connect-2.svc.cluster.local:15002"
+
+# Phase 2 alternative: watch a Kubernetes Service's Endpoints.
+# (Use this *instead of* `backends:` above — not both.)
+#
+# backend_discovery:
+#   type: k8s
+#   namespace: spark-connect
+#   service_name: spark-connect
+#   port: 15002

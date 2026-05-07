@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 scg-config = { path = "../config" }
 scg-genproto = { path = "../genproto" }
+scg-pool-k8s = { path = "../pool-k8s" }
 scg-pool-static = { path = "../pool-static" }
 scg-proxy = { path = "../proxy" }
 scg-routing = { path = "../routing" }

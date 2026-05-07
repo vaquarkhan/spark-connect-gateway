@@ -81,12 +81,32 @@ cargo test --workspace
    spark.range(10).count()  # → 10
    ```
 
-### Run on Kubernetes
+### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
 for sample manifests that stand up two Spark Connect servers via the upstream
-[`apache/spark-kubernetes-operator`][4]. Phase 2 will add a Helm chart for
-the gateway itself.
+[`apache/spark-kubernetes-operator`][4].
+
+Once those servers (and a fronting `Service`) exist, point the gateway at the
+Service's `Endpoints` and let the gateway pick up backends automatically:
+
+```yaml
+bind_addr: ":15003"
+backend_discovery:
+  type: k8s
+  namespace: spark-connect
+  service_name: spark-connect
+  port: 15002
+```
+
+The gateway watches the `Endpoints` object via `kube-rs`. When pods are added,
+removed, or restarted, the gateway's backend list updates within seconds —
+no `kubectl rollout` of the gateway, no config edit. The gateway pod needs a
+`ServiceAccount` with `get`, `list`, and `watch` on `endpoints` in the target
+namespace.
+
+Phase 2 will add a Helm chart that wires up the `ServiceAccount` and `Role`
+for you.
 
 ## Architecture
 
