@@ -1,0 +1,22 @@
+[package]
+name = "scg-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+subtle = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }

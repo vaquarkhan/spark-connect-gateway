@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+scg-auth = { path = "../auth" }
 scg-genproto = { path = "../genproto" }
 scg-routing = { path = "../routing" }
 tokio = { workspace = true }
@@ -22,5 +23,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 scg-store-memory = { path = "../store-memory" }
 scg-pool-static = { path = "../pool-static" }
+scg-auth = { path = "../auth" }
 tokio = { workspace = true }
 async-stream = "0.3"
+parking_lot = { workspace = true }
+

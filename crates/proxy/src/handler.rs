@@ -5,22 +5,50 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
+use scg_auth::{AnonymousAuthenticator, AuthInterceptor, Identity};
 use scg_genproto::pb;
 use scg_routing::{Router, SessionKey};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::dial::Dialer;
 
 /// gRPC handler implementing `SparkConnectService` as a forwarding proxy.
+///
+/// On every RPC the proxy:
+///
+/// 1. Authenticates the inbound request (via the configured
+///    [`AuthInterceptor`]; defaults to `Anonymous` when auth is
+///    disabled in config).
+/// 2. Overwrites the request's `UserContext.user_id` with the verified
+///    identity — never trusting the value the client supplied.
+/// 3. Resolves a backend through the [`Router`].
+/// 4. Forwards the (rewritten) request and pumps the response back.
 pub struct SparkConnectProxy {
     router: Arc<Router>,
     dialer: Arc<Dialer>,
+    auth: AuthInterceptor,
 }
 
 impl SparkConnectProxy {
+    /// Build a proxy with auth disabled. Equivalent to `with_auth` plus
+    /// an `AnonymousAuthenticator` — kept as a convenience for tests
+    /// and Phase 1-style deployments.
     pub fn new(router: Arc<Router>, dialer: Arc<Dialer>) -> Self {
-        Self { router, dialer }
+        Self::with_auth(
+            router,
+            dialer,
+            AuthInterceptor::new(Arc::new(AnonymousAuthenticator)),
+        )
+    }
+
+    pub fn with_auth(router: Arc<Router>, dialer: Arc<Dialer>, auth: AuthInterceptor) -> Self {
+        Self {
+            router,
+            dialer,
+            auth,
+        }
     }
 
     fn client(
@@ -36,10 +64,37 @@ impl SparkConnectProxy {
             .map_err(|e| Status::unavailable(format!("dial backend {}: {}", addr, e)))?;
         Ok(pb::spark_connect_service_client::SparkConnectServiceClient::new(ch))
     }
+
+    /// Authenticate an inbound RPC. Returns the verified `Identity` or
+    /// the `Status::unauthenticated` the proxy should hand back to the
+    /// client.
+    async fn authenticate(&self, metadata: &MetadataMap) -> Result<Arc<Identity>, Status> {
+        let ext = self.auth.authenticate(metadata).await?;
+        Ok(ext.0)
+    }
 }
 
-fn key_from(session_id: &str, uc: Option<&pb::UserContext>) -> SessionKey {
-    SessionKey::new(uc.map(|u| u.user_id.as_str()).unwrap_or(""), session_id)
+/// Build the routing key from a verified identity and the request's
+/// session id. The identity *replaces* whatever `user_id` the client
+/// claimed in `UserContext`.
+fn key_from_identity(session_id: &str, id: &Identity) -> SessionKey {
+    SessionKey::new(id.user_id.as_str(), session_id)
+}
+
+/// Overwrite (or create) `UserContext.user_id` to match the verified
+/// identity. Backend Spark Connect servers consume this value as part
+/// of their SparkSession key, so trusting the client value would let
+/// callers impersonate one another.
+fn stamp_user_context(uc: &mut Option<pb::UserContext>, id: &Identity) {
+    match uc {
+        Some(ctx) => ctx.user_id = id.user_id.clone(),
+        None => {
+            *uc = Some(pb::UserContext {
+                user_id: id.user_id.clone(),
+                ..Default::default()
+            });
+        }
+    }
 }
 
 /// Convert a possibly-empty backend selection into an `Unavailable` Status.
@@ -67,8 +122,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::AnalyzePlanRequest>,
     ) -> Result<Response<pb::AnalyzePlanResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.analyze_plan(Request::new(body)).await
@@ -78,8 +135,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ConfigRequest>,
     ) -> Result<Response<pb::ConfigResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.config(Request::new(body)).await
@@ -89,8 +148,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ArtifactStatusesRequest>,
     ) -> Result<Response<pb::ArtifactStatusesResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.artifact_status(Request::new(body)).await
@@ -100,8 +161,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::InterruptRequest>,
     ) -> Result<Response<pb::InterruptResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         // Interrupt may target a specific operation id (one of several
         // InterruptType variants); when present, route by op id.
         let op_id = match body.interrupt.as_ref() {
@@ -117,8 +180,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ReleaseExecuteRequest>,
     ) -> Result<Response<pb::ReleaseExecuteResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let op_id = body.operation_id.clone();
         let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
         let mut c = self.client(&addr)?;
@@ -133,8 +198,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ReleaseSessionRequest>,
     ) -> Result<Response<pb::ReleaseSessionResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         let resp = c.release_session(Request::new(body)).await?;
@@ -146,8 +213,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::FetchErrorDetailsRequest>,
     ) -> Result<Response<pb::FetchErrorDetailsResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.fetch_error_details(Request::new(body)).await
@@ -157,8 +226,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::CloneSessionRequest>,
     ) -> Result<Response<pb::CloneSessionResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.clone_session(Request::new(body)).await
@@ -168,8 +239,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::GetStatusRequest>,
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
         c.get_status(Request::new(body)).await
@@ -181,8 +254,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ExecutePlanRequest>,
     ) -> Result<Response<Self::ExecutePlanStream>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
 
         // Bind operation_id → backend so a follow-up ReattachExecute reaches
@@ -203,8 +278,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ReattachExecuteRequest>,
     ) -> Result<Response<Self::ReattachExecuteStream>, Status> {
-        let body = req.into_inner();
-        let key = key_from(&body.session_id, body.user_context.as_ref());
+        let identity = self.authenticate(req.metadata()).await?;
+        let mut body = req.into_inner();
+        stamp_user_context(&mut body.user_context, &identity);
+        let key = key_from_identity(&body.session_id, &identity);
         let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
         let mut c = self.client(&addr)?;
         let upstream = c.reattach_execute(Request::new(body)).await?.into_inner();
@@ -217,16 +294,21 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<Streaming<pb::AddArtifactsRequest>>,
     ) -> Result<Response<pb::AddArtifactsResponse>, Status> {
+        // Authenticate from the request metadata before we touch the
+        // streaming body — the credential lives in HTTP/2 headers, not
+        // in any of the message frames.
+        let identity = self.authenticate(req.metadata()).await?;
         let mut inbound = req.into_inner();
 
         // We need the first message to make the routing decision, then we
         // forward it plus the remainder to the chosen backend.
-        let first = inbound
+        let mut first = inbound
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("AddArtifacts: empty client stream"))?;
+        stamp_user_context(&mut first.user_context, &identity);
 
-        let key = key_from(&first.session_id, first.user_context.as_ref());
+        let key = key_from_identity(&first.session_id, &identity);
         let addr = require_addr(self.router.resolve_session(&key))?;
         let mut c = self.client(&addr)?;
 

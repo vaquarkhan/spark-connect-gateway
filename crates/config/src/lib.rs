@@ -66,6 +66,90 @@ pub enum BackendDiscovery {
     },
 }
 
+/// Authentication configuration. Defaults to `none` so Phase 1 configs
+/// keep working unchanged.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthConfig {
+    /// No auth — anyone reaching the gateway is `user_id: anonymous`.
+    /// Acceptable on a trusted network; **not** for production.
+    #[default]
+    None,
+    /// Bearer-token allowlist. See [`scg-auth::token`].
+    Static { tokens: Vec<TokenEntry> },
+    /// Local-key JWT verification. See [`scg-auth::jwt`].
+    Jwt(JwtSettings),
+    /// Remote JWKS / OIDC verification. See [`scg-auth::oidc`].
+    Oidc(OidcSettings),
+}
+
+/// One entry in the static-token table — kept here (rather than only in
+/// `scg-auth`) so config files can describe auth without depending on
+/// the auth crate's serde shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenEntry {
+    pub token: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+/// JWT verification settings; mirrors `scg_auth::jwt::JwtConfig`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JwtSettings {
+    pub key: KeySource,
+    pub algorithms: Vec<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_user_id_claim")]
+    pub user_id_claim: String,
+    #[serde(default)]
+    pub tenant_claim: Option<String>,
+    #[serde(default)]
+    pub groups_claim: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KeySource {
+    PemFile { path: String },
+    PemInline { pem: String },
+    HmacSecret { secret: String },
+}
+
+/// OIDC verification settings; mirrors `scg_auth::oidc::OidcConfig`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcSettings {
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    #[serde(default)]
+    pub discovery_url: Option<String>,
+    pub algorithms: Vec<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_user_id_claim")]
+    pub user_id_claim: String,
+    #[serde(default)]
+    pub tenant_claim: Option<String>,
+    #[serde(default)]
+    pub groups_claim: Option<String>,
+    #[serde(default = "default_refresh_floor_secs")]
+    pub refresh_floor_secs: u64,
+}
+
+fn default_user_id_claim() -> String {
+    "sub".into()
+}
+fn default_refresh_floor_secs() -> u64 {
+    60
+}
+
 /// Raw YAML shape — accepts either the legacy `backends` shorthand or the
 /// tagged `backend_discovery` form, never both.
 #[derive(Debug, Deserialize)]
@@ -76,12 +160,15 @@ struct RawConfig {
     backends: Option<Vec<String>>,
     #[serde(default)]
     backend_discovery: Option<BackendDiscovery>,
+    #[serde(default)]
+    auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub discovery: BackendDiscovery,
+    pub auth: AuthConfig,
 }
 
 fn default_bind_addr() -> String {
@@ -129,6 +216,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             discovery,
+            auth: raw.auth.unwrap_or_default(),
         })
     }
 }
@@ -261,5 +349,95 @@ backend_discovery:
         let f = write("backends: [\"a:1\"]\n");
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.bind_addr, ":15003");
+    }
+
+    #[test]
+    fn auth_defaults_to_none() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(matches!(c.auth, AuthConfig::None));
+    }
+
+    #[test]
+    fn loads_static_auth() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+auth:
+  type: static
+  tokens:
+    - token: "alice-secret"
+      user_id: "alice"
+      tenant: "team-a"
+      groups: ["devs"]
+    - token: "bob-secret"
+      user_id: "bob"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.auth {
+            AuthConfig::Static { tokens } => {
+                assert_eq!(tokens.len(), 2);
+                assert_eq!(tokens[0].user_id, "alice");
+                assert_eq!(tokens[0].tenant.as_deref(), Some("team-a"));
+                assert_eq!(tokens[1].user_id, "bob");
+                assert!(tokens[1].tenant.is_none());
+            }
+            other => panic!("expected Static, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn loads_jwt_auth() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+auth:
+  type: jwt
+  algorithms: ["RS256"]
+  issuer: "https://idp.example.com"
+  audience: "spark-connect-gateway"
+  key:
+    kind: pem_file
+    path: "/etc/gateway/idp-pub.pem"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.auth {
+            AuthConfig::Jwt(s) => {
+                assert_eq!(s.algorithms, vec!["RS256"]);
+                assert_eq!(s.issuer.as_deref(), Some("https://idp.example.com"));
+                match s.key {
+                    KeySource::PemFile { path } => assert_eq!(path, "/etc/gateway/idp-pub.pem"),
+                    other => panic!("expected PemFile, got {:?}", other),
+                }
+            }
+            other => panic!("expected Jwt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn loads_oidc_auth() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+auth:
+  type: oidc
+  algorithms: ["RS256"]
+  discovery_url: "https://idp.example.com/.well-known/openid-configuration"
+  audience: "spark-connect-gateway"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.auth {
+            AuthConfig::Oidc(s) => {
+                assert_eq!(
+                    s.discovery_url.as_deref(),
+                    Some("https://idp.example.com/.well-known/openid-configuration")
+                );
+                assert!(s.jwks_url.is_none());
+            }
+            other => panic!("expected Oidc, got {:?}", other),
+        }
     }
 }

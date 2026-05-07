@@ -7,6 +7,7 @@ members = [
     "crates/store-memory",
     "crates/pool-static",
     "crates/pool-k8s",
+    "crates/auth",
     "crates/config",
     "crates/genproto",
 ]
@@ -47,6 +48,11 @@ parking_lot = "0.12"
 # K8s
 kube = { version = "3.1", features = ["runtime", "client"] }
 k8s-openapi = { version = "0.27", features = ["latest"] }
+
+# Auth
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+subtle = "2"
 
 # Test-only
 tempfile = "3"

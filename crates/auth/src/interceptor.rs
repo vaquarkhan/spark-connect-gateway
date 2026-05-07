@@ -1,0 +1,58 @@
+//! Tonic interceptor that runs an `Authenticator` and stamps the
+//! verified `Identity` onto the request's extensions.
+//!
+//! Note on async vs sync interceptors:
+//!
+//! Tonic's built-in `Interceptor` trait is *sync*. Some authenticators
+//! (notably OIDC with JWKS rotation) need to await network I/O, which
+//! a sync interceptor can't do. We therefore expose this interceptor
+//! via a free function that the proxy calls explicitly at the head of
+//! every RPC handler — see `crates/proxy` for the call site.
+//!
+//! That keeps the framework boundary clean: the proxy is responsible
+//! for reading the inbound metadata, calling `authenticate`, attaching
+//! the resulting identity, and *then* dispatching to the per-RPC
+//! method body. Phase 2's small handful of RPCs makes this manageable;
+//! a tower-layer-based async interceptor is on the Phase 4 list.
+
+use std::sync::Arc;
+use tonic::metadata::MetadataMap;
+use tonic::Status;
+
+use crate::identity::IdentityExt;
+use crate::Authenticator;
+
+/// Owned wrapper around an `Arc<dyn Authenticator>`. The proxy holds
+/// one of these; calling [`AuthInterceptor::authenticate`] is what
+/// every RPC does as its first step.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    inner: Arc<dyn Authenticator>,
+}
+
+impl AuthInterceptor {
+    pub fn new(inner: Arc<dyn Authenticator>) -> Self {
+        Self { inner }
+    }
+
+    /// Run authentication against the metadata; on success return the
+    /// `IdentityExt` the proxy should attach to the request before
+    /// dispatching.
+    pub async fn authenticate(&self, metadata: &MetadataMap) -> Result<IdentityExt, Status> {
+        let id = self.inner.authenticate(metadata).await?;
+        Ok(IdentityExt(Arc::new(id)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AnonymousAuthenticator;
+
+    #[tokio::test]
+    async fn delegates_to_inner_authenticator() {
+        let i = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
+        let ext = i.authenticate(&MetadataMap::new()).await.unwrap();
+        assert_eq!(ext.0.user_id, "anonymous");
+    }
+}

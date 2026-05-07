@@ -10,6 +10,7 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
+scg-auth = { path = "../auth" }
 scg-config = { path = "../config" }
 scg-genproto = { path = "../genproto" }
 scg-pool-k8s = { path = "../pool-k8s" }

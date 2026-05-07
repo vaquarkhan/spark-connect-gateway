@@ -81,6 +81,55 @@ cargo test --workspace
    spark.range(10).count()  # → 10
    ```
 
+### Authentication
+
+By default the gateway runs without authentication (every caller is
+`user_id: anonymous`). Production deployments configure one of three
+authenticators:
+
+```yaml
+# Bearer-token allowlist (dev / single-team):
+auth:
+  type: static
+  tokens:
+    - { token: "alice-secret", user_id: "alice", tenant: "team-a", groups: ["devs"] }
+    - { token: "bob-secret",   user_id: "bob" }
+```
+
+```yaml
+# JWT signed by a known IdP, verified against a local public key:
+auth:
+  type: jwt
+  algorithms: ["RS256"]
+  issuer: "https://idp.example.com"
+  audience: "spark-connect-gateway"
+  key:
+    kind: pem_file
+    path: /etc/gateway/idp-pub.pem
+```
+
+```yaml
+# OIDC / JWKS — gateway fetches keys from the IdP, refreshes on rotation:
+auth:
+  type: oidc
+  algorithms: ["RS256"]
+  discovery_url: "https://idp.example.com/.well-known/openid-configuration"
+  audience: "spark-connect-gateway"
+```
+
+In all three cases the gateway *replaces* whatever `user_id` the client
+declares in `UserContext` with the verified identity from the
+authenticator — clients cannot impersonate other users.
+
+Clients pass the credential via gRPC metadata:
+
+```python
+# PySpark Spark Connect client picks up the token from the URI:
+spark = SparkSession.builder.remote(
+    "sc://localhost:15003/;token=alice-secret"
+).getOrCreate()
+```
+
 ### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
