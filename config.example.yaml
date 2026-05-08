@@ -1,6 +1,10 @@
 # Address the gateway will bind to. Default :15003 (0.0.0.0:15003).
 bind_addr: ":15003"
 
+# Address for the admin HTTP server (Prometheus /metrics + /healthz +
+# /readyz). Set to null to disable. Default :9090.
+admin_addr: ":9090"
+
 # Static list of Spark Connect server backends. Phase 1 shorthand —
 # equivalent to `backend_discovery: { type: static, addresses: [...] }`.
 backends:

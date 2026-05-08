@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 scg-auth = { path = "../auth" }
 scg-genproto = { path = "../genproto" }
+scg-observability = { path = "../observability" }
 scg-routing = { path = "../routing" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -24,7 +25,9 @@ thiserror = { workspace = true }
 scg-store-memory = { path = "../store-memory" }
 scg-pool-static = { path = "../pool-static" }
 scg-auth = { path = "../auth" }
+scg-observability = { path = "../observability" }
 tokio = { workspace = true }
 async-stream = "0.3"
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
 

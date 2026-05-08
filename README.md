@@ -81,6 +81,39 @@ cargo test --workspace
    spark.range(10).count()  # → 10
    ```
 
+### Observability
+
+The gateway exposes a Prometheus `/metrics` endpoint, plus
+`/healthz` and `/readyz` probes, on a separate `admin_addr`
+(default `:9090`). Set `admin_addr: null` to disable.
+
+Metric set (snake_case, `scg_` prefix, label cardinality bounded):
+
+| Metric | Type | Labels | What |
+|---|---|---|---|
+| `scg_rpcs_total` | counter | `rpc`, `code` | Per-RPC totals tagged by final gRPC status code |
+| `scg_rpc_duration_seconds` | histogram | `rpc` | Gateway-side end-to-end duration |
+| `scg_auth_failures_total` | counter | `reason` | Failed auth (`missing_token`, `invalid_token`, `expired`, `unknown_kid`, `unknown`) |
+| `scg_backend_pool_size` | gauge | — | Current healthy-backend count |
+| `scg_active_streams` | gauge | — | In-flight streaming RPCs (`ExecutePlan`, `ReattachExecute`, `AddArtifacts`) |
+
+Per-RPC structured logs include a correlation ID (`rid`); the same
+ID is forwarded to the backend via `x-request-id` metadata so backend
+logs can be joined.
+
+Scrape config example for Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: spark-connect-gateway
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: admin
+        action: keep
+```
+
 ### Authentication
 
 By default the gateway runs without authentication (every caller is

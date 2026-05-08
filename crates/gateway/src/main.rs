@@ -15,11 +15,13 @@ use scg_config::{
     TokenEntry as CfgTokenEntry,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
+use scg_observability::{serve_admin, AdminConfig, Metrics, ReadinessProbe};
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
 use scg_routing::{AffinityStore, Pool, Router};
 use scg_store_memory::MemoryStore;
+use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -39,23 +41,77 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = Config::load(&args.config).with_context(|| format!("loading {}", args.config))?;
 
-    let (pool, _watcher) = build_pool(&cfg.discovery).await?;
+    let metrics = Metrics::new().context("building metrics registry")?;
+
+    // Static pools are ready immediately; K8s watch pools become ready
+    // when the watcher emits its first list event (we approximate by
+    // marking ready once the watcher *starts* — the gateway will
+    // simply return Unavailable until backends are populated).
+    let readiness = ReadinessProbe::default();
+
+    let (pool, _watcher) = build_pool(&cfg.discovery, &metrics, &readiness).await?;
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
     let router = Arc::new(Router::new(pool, store));
     let dialer = Dialer::new();
 
     let auth = build_auth(&cfg.auth).await?;
-    let svc = SparkConnectProxy::with_auth(router, dialer, AuthInterceptor::new(auth));
+    let svc = SparkConnectProxy::with_auth_and_metrics(
+        router,
+        dialer,
+        AuthInterceptor::new(auth),
+        metrics.clone(),
+    );
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
     log_startup(&cfg, &addr);
 
-    Server::builder()
-        .add_service(SparkConnectServiceServer::new(svc))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await
-        .context("gRPC server error")?;
+    // Coordinate shutdown across the two servers (gRPC + admin) using a
+    // watch channel.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
 
+    let admin_handle = if let Some(admin_addr_str) = &cfg.admin_addr {
+        let admin_addr = parse_bind_addr(admin_addr_str)?;
+        let admin_cfg = AdminConfig {
+            bind_addr: admin_addr,
+        };
+        let metrics_for_admin = metrics.clone();
+        let readiness_for_admin = readiness.clone();
+        let mut shutdown_rx_admin = shutdown_rx.clone();
+        let handle = tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx_admin.changed().await;
+            };
+            if let Err(e) =
+                serve_admin(admin_cfg, metrics_for_admin, readiness_for_admin, shutdown).await
+            {
+                tracing::warn!(error = %e, "admin server stopped with error");
+            }
+        });
+        Some(handle)
+    } else {
+        info!("admin_addr is null in config; skipping admin/metrics endpoint");
+        None
+    };
+
+    let grpc_shutdown = async move {
+        let _ = shutdown_rx.changed().await;
+    };
+
+    let grpc_result = Server::builder()
+        .add_service(SparkConnectServiceServer::new(svc))
+        .serve_with_shutdown(addr, grpc_shutdown)
+        .await
+        .context("gRPC server error");
+
+    if let Some(h) = admin_handle {
+        let _ = h.await;
+    }
+
+    grpc_result?;
     info!("shutdown complete");
     Ok(())
 }
@@ -65,10 +121,15 @@ async fn main() -> Result<()> {
 /// so the caller can keep it alive for the lifetime of the server.
 async fn build_pool(
     discovery: &BackendDiscovery,
+    metrics: &Metrics,
+    readiness: &ReadinessProbe,
 ) -> Result<(Arc<dyn Pool>, Option<tokio::task::JoinHandle<()>>)> {
     match discovery {
         BackendDiscovery::Static { addresses } => {
             let pool = StaticPool::new(addresses.clone()).context("building static pool")?;
+            metrics.set_backend_pool_size(addresses.len() as i64);
+            // Static pool is always ready: addresses are known at load time.
+            readiness.mark_ready();
             Ok((Arc::new(pool), None))
         }
         BackendDiscovery::K8s {
@@ -86,6 +147,16 @@ async fn build_pool(
                 .spawn_watcher(cfg)
                 .await
                 .context("spawning K8s Endpoints watcher")?;
+            // Optimistic: once the watcher task is scheduled we mark
+            // readiness, even if it hasn't yet emitted its first list
+            // event. /readyz still returns 200 here; clients hitting
+            // the gateway during the brief gap get Unavailable from
+            // the proxy ("no healthy backend available").
+            readiness.mark_ready();
+            // Initial pool size is zero; K8sPool emits a tracing event
+            // on each watcher update. Phase 2.5 will let the K8s pool
+            // notify the metrics handle directly.
+            metrics.set_backend_pool_size(0);
             Ok((Arc::new(pool), Some(handle)))
         }
     }

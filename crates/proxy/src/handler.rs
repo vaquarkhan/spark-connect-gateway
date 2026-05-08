@@ -7,10 +7,12 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt};
 use scg_auth::{AnonymousAuthenticator, AuthInterceptor, Identity};
 use scg_genproto::pb;
+use scg_observability::{request_id, Metrics, RpcGuard, REQUEST_ID_HEADER};
 use scg_routing::{Router, SessionKey};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::metadata::MetadataMap;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{info, warn};
 
 use crate::dial::Dialer;
 
@@ -18,37 +20,67 @@ use crate::dial::Dialer;
 ///
 /// On every RPC the proxy:
 ///
-/// 1. Authenticates the inbound request (via the configured
+/// 1. Starts a per-RPC [`RpcGuard`] that records duration + the final
+///    gRPC code on Drop.
+/// 2. Generates a correlation ID; stamps it on the tracing span and on
+///    the outbound `x-request-id` metadata.
+/// 3. Authenticates the inbound request (via the configured
 ///    [`AuthInterceptor`]; defaults to `Anonymous` when auth is
 ///    disabled in config).
-/// 2. Overwrites the request's `UserContext.user_id` with the verified
+/// 4. Overwrites the request's `UserContext.user_id` with the verified
 ///    identity — never trusting the value the client supplied.
-/// 3. Resolves a backend through the [`Router`].
-/// 4. Forwards the (rewritten) request and pumps the response back.
+/// 5. Resolves a backend through the [`Router`].
+/// 6. Forwards the (rewritten) request and pumps the response back.
 pub struct SparkConnectProxy {
     router: Arc<Router>,
     dialer: Arc<Dialer>,
     auth: AuthInterceptor,
+    /// Metrics handle. Required (we always want metrics): pass a
+    /// freshly built `Metrics::new()?` in tests where you don't care
+    /// about scraping.
+    metrics: Metrics,
 }
 
 impl SparkConnectProxy {
-    /// Build a proxy with auth disabled. Equivalent to `with_auth` plus
-    /// an `AnonymousAuthenticator` — kept as a convenience for tests
-    /// and Phase 1-style deployments.
+    /// Build a proxy with auth disabled and a fresh, throwaway
+    /// `Metrics`. Used by tests and Phase 1-style deployments.
+    ///
+    /// Production deployments use [`SparkConnectProxy::with_auth`] and
+    /// hand in a `Metrics` shared with the admin server.
     pub fn new(router: Arc<Router>, dialer: Arc<Dialer>) -> Self {
-        Self::with_auth(
+        let metrics = Metrics::new().expect("Metrics::new() in test scaffolding");
+        Self::with_auth_and_metrics(
             router,
             dialer,
             AuthInterceptor::new(Arc::new(AnonymousAuthenticator)),
+            metrics,
         )
     }
 
+    /// Build a proxy with the given auth interceptor and a fresh
+    /// `Metrics`. Convenient for auth-only tests.
     pub fn with_auth(router: Arc<Router>, dialer: Arc<Dialer>, auth: AuthInterceptor) -> Self {
+        let metrics = Metrics::new().expect("Metrics::new() in test scaffolding");
+        Self::with_auth_and_metrics(router, dialer, auth, metrics)
+    }
+
+    /// Production constructor: hand in everything explicitly.
+    pub fn with_auth_and_metrics(
+        router: Arc<Router>,
+        dialer: Arc<Dialer>,
+        auth: AuthInterceptor,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             router,
             dialer,
             auth,
+            metrics,
         }
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     fn client(
@@ -67,10 +99,32 @@ impl SparkConnectProxy {
 
     /// Authenticate an inbound RPC. Returns the verified `Identity` or
     /// the `Status::unauthenticated` the proxy should hand back to the
-    /// client.
+    /// client. Auth failures bump `scg_auth_failures_total`.
     async fn authenticate(&self, metadata: &MetadataMap) -> Result<Arc<Identity>, Status> {
-        let ext = self.auth.authenticate(metadata).await?;
-        Ok(ext.0)
+        match self.auth.authenticate(metadata).await {
+            Ok(ext) => Ok(ext.0),
+            Err(status) => {
+                let reason = auth_failure_reason(&status);
+                self.metrics.record_auth_failure(reason);
+                Err(status)
+            }
+        }
+    }
+}
+
+/// Map an auth Status into a small, fixed-cardinality reason label.
+fn auth_failure_reason(status: &Status) -> &'static str {
+    let m = status.message();
+    if m.contains("missing") {
+        "missing_token"
+    } else if m.contains("expired") {
+        "expired"
+    } else if m.contains("kid") {
+        "unknown_kid"
+    } else if m.contains("invalid") {
+        "invalid_token"
+    } else {
+        "unknown"
     }
 }
 
@@ -105,6 +159,46 @@ fn require_addr(addr: Option<String>) -> Result<String, Status> {
     addr.ok_or_else(|| Status::unavailable("no healthy backend available"))
 }
 
+/// Map a Status code into the small fixed string used in metric labels.
+fn status_code_label(status: &Status) -> &'static str {
+    match status.code() {
+        tonic::Code::Ok => "OK",
+        tonic::Code::Cancelled => "Cancelled",
+        tonic::Code::Unknown => "Unknown",
+        tonic::Code::InvalidArgument => "InvalidArgument",
+        tonic::Code::DeadlineExceeded => "DeadlineExceeded",
+        tonic::Code::NotFound => "NotFound",
+        tonic::Code::AlreadyExists => "AlreadyExists",
+        tonic::Code::PermissionDenied => "PermissionDenied",
+        tonic::Code::ResourceExhausted => "ResourceExhausted",
+        tonic::Code::FailedPrecondition => "FailedPrecondition",
+        tonic::Code::Aborted => "Aborted",
+        tonic::Code::OutOfRange => "OutOfRange",
+        tonic::Code::Unimplemented => "Unimplemented",
+        tonic::Code::Internal => "Internal",
+        tonic::Code::Unavailable => "Unavailable",
+        tonic::Code::DataLoss => "DataLoss",
+        tonic::Code::Unauthenticated => "Unauthenticated",
+    }
+}
+
+/// Inject the gateway's correlation ID onto an outbound request's
+/// metadata so backend logs can correlate.
+fn stamp_request_id<T>(req: &mut Request<T>, request_id: &str) {
+    if let Ok(v) = MetadataValue::try_from(request_id) {
+        req.metadata_mut().insert(REQUEST_ID_HEADER, v);
+    }
+}
+
+/// Update an `RpcGuard` with the final code from a `Status` (or "OK"
+/// when the result is Ok).
+fn finalise_guard<T>(guard: &mut RpcGuard, result: &Result<T, Status>) {
+    match result {
+        Ok(_) => guard.record("OK"),
+        Err(s) => guard.record(status_code_label(s)),
+    }
+}
+
 /// Forward a tonic streaming response to a fresh server-stream sent through
 /// `tx`. We don't pipe directly to the inbound `Streaming` because we need
 /// to return early on the first error and report it as a Status.
@@ -122,130 +216,213 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::AnalyzePlanRequest>,
     ) -> Result<Response<pb::AnalyzePlanResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.analyze_plan(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("AnalyzePlan");
+        let rid = request_id();
+        let result: Result<Response<pb::AnalyzePlanResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            info!(rid = %rid, rpc = "AnalyzePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.analyze_plan(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn config(
         &self,
         req: Request<pb::ConfigRequest>,
     ) -> Result<Response<pb::ConfigResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.config(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("Config");
+        let rid = request_id();
+        let result: Result<Response<pb::ConfigResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            info!(rid = %rid, rpc = "Config", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.config(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn artifact_status(
         &self,
         req: Request<pb::ArtifactStatusesRequest>,
     ) -> Result<Response<pb::ArtifactStatusesResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.artifact_status(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("ArtifactStatus");
+        let rid = request_id();
+        let result: Result<Response<pb::ArtifactStatusesResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.artifact_status(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn interrupt(
         &self,
         req: Request<pb::InterruptRequest>,
     ) -> Result<Response<pb::InterruptResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        // Interrupt may target a specific operation id (one of several
-        // InterruptType variants); when present, route by op id.
-        let op_id = match body.interrupt.as_ref() {
-            Some(pb::interrupt_request::Interrupt::OperationId(id)) => id.clone(),
-            _ => String::new(),
-        };
-        let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
-        let mut c = self.client(&addr)?;
-        c.interrupt(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("Interrupt");
+        let rid = request_id();
+        let result: Result<Response<pb::InterruptResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            // Interrupt may target a specific operation id (one of several
+            // InterruptType variants); when present, route by op id.
+            let op_id = match body.interrupt.as_ref() {
+                Some(pb::interrupt_request::Interrupt::OperationId(id)) => id.clone(),
+                _ => String::new(),
+            };
+            let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.interrupt(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn release_execute(
         &self,
         req: Request<pb::ReleaseExecuteRequest>,
     ) -> Result<Response<pb::ReleaseExecuteResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let op_id = body.operation_id.clone();
-        let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
-        let mut c = self.client(&addr)?;
-        let resp = c.release_execute(Request::new(body)).await?;
-        // On a successful release the server has dropped the operation, so
-        // we drop our reverse-index entry too.
-        self.router.forget_op(&op_id);
-        Ok(resp)
+        let mut guard = self.metrics.rpc_guard("ReleaseExecute");
+        let rid = request_id();
+        let result: Result<Response<pb::ReleaseExecuteResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let op_id = body.operation_id.clone();
+            let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            let resp = c.release_execute(outbound).await?;
+            // On a successful release the server has dropped the operation, so
+            // we drop our reverse-index entry too.
+            self.router.forget_op(&op_id);
+            Ok(resp)
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn release_session(
         &self,
         req: Request<pb::ReleaseSessionRequest>,
     ) -> Result<Response<pb::ReleaseSessionResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        let resp = c.release_session(Request::new(body)).await?;
-        self.router.forget_session(&key);
-        Ok(resp)
+        let mut guard = self.metrics.rpc_guard("ReleaseSession");
+        let rid = request_id();
+        let result: Result<Response<pb::ReleaseSessionResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            let resp = c.release_session(outbound).await?;
+            self.router.forget_session(&key);
+            Ok(resp)
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn fetch_error_details(
         &self,
         req: Request<pb::FetchErrorDetailsRequest>,
     ) -> Result<Response<pb::FetchErrorDetailsResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.fetch_error_details(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("FetchErrorDetails");
+        let rid = request_id();
+        let result: Result<Response<pb::FetchErrorDetailsResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.fetch_error_details(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn clone_session(
         &self,
         req: Request<pb::CloneSessionRequest>,
     ) -> Result<Response<pb::CloneSessionResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.clone_session(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("CloneSession");
+        let rid = request_id();
+        let result: Result<Response<pb::CloneSessionResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.clone_session(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn get_status(
         &self,
         req: Request<pb::GetStatusRequest>,
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
-        c.get_status(Request::new(body)).await
+        let mut guard = self.metrics.rpc_guard("GetStatus");
+        let rid = request_id();
+        let result: Result<Response<pb::GetStatusResponse>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            c.get_status(outbound).await
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     // ----- Server-streaming RPCs ----------------------------------------
@@ -254,38 +431,59 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<pb::ExecutePlanRequest>,
     ) -> Result<Response<Self::ExecutePlanStream>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
+        let mut guard = self.metrics.rpc_guard("ExecutePlan");
+        let _stream_guard = self.metrics.stream_guard();
+        let rid = request_id();
+        let result: Result<Response<Self::ExecutePlanStream>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            info!(rid = %rid, rpc = "ExecutePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding stream");
 
-        // Bind operation_id → backend so a follow-up ReattachExecute reaches
-        // the same driver even if its session id is missing or has been
-        // forgotten by the affinity cache.
-        if let Some(op_id) = body.operation_id.clone() {
-            if !op_id.is_empty() {
-                self.router.remember_op(op_id, addr.clone());
+            // Bind operation_id → backend so a follow-up ReattachExecute reaches
+            // the same driver even if its session id is missing or has been
+            // forgotten by the affinity cache.
+            if let Some(op_id) = body.operation_id.clone() {
+                if !op_id.is_empty() {
+                    self.router.remember_op(op_id, addr.clone());
+                }
             }
-        }
 
-        let mut c = self.client(&addr)?;
-        let upstream = c.execute_plan(Request::new(body)).await?.into_inner();
-        Ok(Response::new(forward_server_stream(upstream)))
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            let upstream = c.execute_plan(outbound).await?.into_inner();
+            Ok(Response::new(forward_server_stream(upstream)))
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     async fn reattach_execute(
         &self,
         req: Request<pb::ReattachExecuteRequest>,
     ) -> Result<Response<Self::ReattachExecuteStream>, Status> {
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut body = req.into_inner();
-        stamp_user_context(&mut body.user_context, &identity);
-        let key = key_from_identity(&body.session_id, &identity);
-        let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
-        let mut c = self.client(&addr)?;
-        let upstream = c.reattach_execute(Request::new(body)).await?.into_inner();
-        Ok(Response::new(forward_server_stream(upstream)))
+        let mut guard = self.metrics.rpc_guard("ReattachExecute");
+        let _stream_guard = self.metrics.stream_guard();
+        let rid = request_id();
+        let result: Result<Response<Self::ReattachExecuteStream>, Status> = async {
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut body = req.into_inner();
+            stamp_user_context(&mut body.user_context, &identity);
+            let key = key_from_identity(&body.session_id, &identity);
+            let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
+            let mut c = self.client(&addr)?;
+            let mut outbound = Request::new(body);
+            stamp_request_id(&mut outbound, &rid);
+            let upstream = c.reattach_execute(outbound).await?.into_inner();
+            Ok(Response::new(forward_server_stream(upstream)))
+        }
+        .await;
+        finalise_guard(&mut guard, &result);
+        result
     }
 
     // ----- Client-streaming RPCs ----------------------------------------
@@ -294,46 +492,52 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         &self,
         req: Request<Streaming<pb::AddArtifactsRequest>>,
     ) -> Result<Response<pb::AddArtifactsResponse>, Status> {
-        // Authenticate from the request metadata before we touch the
-        // streaming body — the credential lives in HTTP/2 headers, not
-        // in any of the message frames.
-        let identity = self.authenticate(req.metadata()).await?;
-        let mut inbound = req.into_inner();
+        let mut guard = self.metrics.rpc_guard("AddArtifacts");
+        let _stream_guard = self.metrics.stream_guard();
+        let rid = request_id();
+        let result: Result<Response<pb::AddArtifactsResponse>, Status> = async {
+            // Authenticate from the request metadata before we touch the
+            // streaming body — the credential lives in HTTP/2 headers, not
+            // in any of the message frames.
+            let identity = self.authenticate(req.metadata()).await?;
+            let mut inbound = req.into_inner();
 
-        // We need the first message to make the routing decision, then we
-        // forward it plus the remainder to the chosen backend.
-        let mut first = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("AddArtifacts: empty client stream"))?;
-        stamp_user_context(&mut first.user_context, &identity);
+            // We need the first message to make the routing decision, then we
+            // forward it plus the remainder to the chosen backend.
+            let mut first = inbound
+                .message()
+                .await?
+                .ok_or_else(|| Status::invalid_argument("AddArtifacts: empty client stream"))?;
+            stamp_user_context(&mut first.user_context, &identity);
 
-        let key = key_from_identity(&first.session_id, &identity);
-        let addr = require_addr(self.router.resolve_session(&key))?;
-        let mut c = self.client(&addr)?;
+            let key = key_from_identity(&first.session_id, &identity);
+            let addr = require_addr(self.router.resolve_session(&key))?;
+            let mut c = self.client(&addr)?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<pb::AddArtifactsRequest>(8);
-        // First message goes through the channel before we await the RPC,
-        // so the upstream sees it as the very first request.
-        tx.send(first)
-            .await
-            .map_err(|_| Status::cancelled("backend closed"))?;
+            let (tx, rx) = tokio::sync::mpsc::channel::<pb::AddArtifactsRequest>(8);
+            tx.send(first)
+                .await
+                .map_err(|_| Status::cancelled("backend closed"))?;
 
-        // Spawn a task that drains the inbound client stream onto the
-        // outbound channel. When inbound ends, dropping `tx` signals
-        // end-of-stream to the backend.
-        tokio::spawn(async move {
-            while let Ok(Some(m)) = inbound.message().await {
-                if tx.send(m).await.is_err() {
-                    break;
+            tokio::spawn(async move {
+                while let Ok(Some(m)) = inbound.message().await {
+                    if tx.send(m).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        let resp = c
-            .add_artifacts(Request::new(ReceiverStream::new(rx)))
-            .await?;
-        Ok(resp)
+            let mut outbound = Request::new(ReceiverStream::new(rx));
+            stamp_request_id(&mut outbound, &rid);
+            let resp = c.add_artifacts(outbound).await?;
+            Ok(resp)
+        }
+        .await;
+        if let Err(ref e) = result {
+            warn!(rid = %rid, error = %e, "AddArtifacts failed");
+        }
+        finalise_guard(&mut guard, &result);
+        result
     }
 }
 

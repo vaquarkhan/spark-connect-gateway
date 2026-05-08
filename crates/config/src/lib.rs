@@ -162,6 +162,14 @@ struct RawConfig {
     backend_discovery: Option<BackendDiscovery>,
     #[serde(default)]
     auth: Option<AuthConfig>,
+    /// Address for the admin / metrics HTTP server. `null` disables it.
+    /// Default `0.0.0.0:9090`.
+    #[serde(default = "default_admin_addr_opt")]
+    admin_addr: Option<String>,
+}
+
+fn default_admin_addr_opt() -> Option<String> {
+    Some(":9090".into())
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +177,8 @@ pub struct Config {
     pub bind_addr: String,
     pub discovery: BackendDiscovery,
     pub auth: AuthConfig,
+    /// `Some(addr)` to enable the admin HTTP server, `None` to skip it.
+    pub admin_addr: Option<String>,
 }
 
 fn default_bind_addr() -> String {
@@ -217,6 +227,7 @@ impl Config {
             bind_addr,
             discovery,
             auth: raw.auth.unwrap_or_default(),
+            admin_addr: raw.admin_addr.filter(|s| !s.is_empty()),
         })
     }
 }

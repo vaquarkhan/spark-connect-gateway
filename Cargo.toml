@@ -8,6 +8,7 @@ members = [
     "crates/pool-static",
     "crates/pool-k8s",
     "crates/auth",
+    "crates/observability",
     "crates/config",
     "crates/genproto",
 ]
@@ -53,6 +54,14 @@ k8s-openapi = { version = "0.27", features = ["latest"] }
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 subtle = "2"
+
+# Observability
+prometheus = "0.14"
+uuid = { version = "1", features = ["v4"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 # Test-only
 tempfile = "3"
