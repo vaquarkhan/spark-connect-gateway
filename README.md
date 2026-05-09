@@ -292,6 +292,20 @@ with `affinityStore.type: memory`, since that combination silently
 breaks Spark Connect's per-driver session invariant — `redis` is the
 default for exactly that reason.
 
+### Operator docs
+
+For day-2 operations, see:
+
+* [`docs/deployment.md`](docs/deployment.md) — from-zero deployment
+  runbook: prerequisites, install, hardening, upgrades, uninstall.
+* [`docs/observability.md`](docs/observability.md) — every `scg_*`
+  metric explained, PromQL examples, log line anatomy, distributed
+  tracing guide, suggested alerts.
+* [`docs/runbook.md`](docs/runbook.md) — symptom → diagnosis → fix
+  for the failures you'll actually hit (CrashLoopBackOff, `/readyz`
+  503, broken stickiness, Redis outage, auth failure spikes, K8s
+  RBAC, latency regressions).
+
 ### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
