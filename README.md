@@ -269,6 +269,29 @@ cargo run -p scg-proxy --example ha_smoke
 Exits zero on success; panics with a descriptive assertion message
 on any failure, so a CI script can wrap it directly.
 
+### Deploy on Kubernetes (Helm)
+
+A Helm chart is shipped at [`deploy/helm/scg/`](deploy/helm/scg/).
+Quickstart:
+
+```bash
+helm install scg ./deploy/helm/scg \
+  --namespace spark-connect --create-namespace
+```
+
+Defaults give you 2 gateway replicas + a bundled Redis StatefulSet
+(AOF-persisted), with a static backend list pointing at
+`spark-connect-{1,2}.svc.cluster.local:15002`. Switch to K8s
+service-watch discovery, JWT auth, OTLP tracing, or an external
+managed Redis with a few values flips — see the chart's
+[`values.yaml`](deploy/helm/scg/values.yaml) and
+[`README.md`](deploy/helm/scg/README.md) for the full reference.
+
+The chart fails template-time if you set `replicaCount > 1` together
+with `affinityStore.type: memory`, since that combination silently
+breaks Spark Connect's per-driver session invariant — `redis` is the
+default for exactly that reason.
+
 ### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)

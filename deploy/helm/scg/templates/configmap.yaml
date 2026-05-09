@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scg.fullname" . }}-config
+  labels:
+    {{- include "scg.gateway.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    bind_addr: ":{{ .Values.service.grpcPort }}"
+    admin_addr: ":{{ .Values.service.adminPort }}"
+
+    {{- /* ---- backend discovery ---- */}}
+    {{- if eq .Values.backendDiscovery.type "static" }}
+    backends:
+      {{- range .Values.backendDiscovery.static.addresses }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- else if eq .Values.backendDiscovery.type "k8s" }}
+    backend_discovery:
+      type: k8s
+      namespace: {{ .Values.backendDiscovery.k8s.namespace | quote }}
+      service_name: {{ .Values.backendDiscovery.k8s.serviceName | quote }}
+      port: {{ .Values.backendDiscovery.k8s.port }}
+    {{- else }}
+    {{- fail (printf "backendDiscovery.type must be 'static' or 'k8s', got %q" .Values.backendDiscovery.type) }}
+    {{- end }}
+
+    {{- /* ---- auth ---- */}}
+    {{- if eq .Values.auth.type "none" }}
+    auth:
+      type: none
+    {{- else if eq .Values.auth.type "static" }}
+    auth:
+      type: static
+      tokens:
+        {{- range .Values.auth.static.tokens }}
+        - token: {{ .token | quote }}
+          user_id: {{ .userId | quote }}
+          {{- if .tenant }}
+          tenant: {{ .tenant | quote }}
+          {{- end }}
+          {{- if .groups }}
+          groups:
+            {{- range .groups }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+    {{- else if eq .Values.auth.type "jwt" }}
+    auth:
+      type: jwt
+      algorithms:
+        {{- range .Values.auth.jwt.algorithms }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- if .Values.auth.jwt.issuer }}
+      issuer: {{ .Values.auth.jwt.issuer | quote }}
+      {{- end }}
+      {{- if .Values.auth.jwt.audience }}
+      audience: {{ .Values.auth.jwt.audience | quote }}
+      {{- end }}
+      user_id_claim: {{ .Values.auth.jwt.userIdClaim | quote }}
+      {{- if .Values.auth.jwt.tenantClaim }}
+      tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
+      {{- end }}
+      {{- if .Values.auth.jwt.groupsClaim }}
+      groups_claim: {{ .Values.auth.jwt.groupsClaim | quote }}
+      {{- end }}
+      key:
+        {{- if eq .Values.auth.jwt.key.kind "pemFile" }}
+        kind: pem_file
+        path: {{ required "auth.jwt.key.path required when kind=pemFile" .Values.auth.jwt.key.path | quote }}
+        {{- else if eq .Values.auth.jwt.key.kind "pemInline" }}
+        kind: pem_inline
+        pem: |
+          {{- required "auth.jwt.key.pem required when kind=pemInline" .Values.auth.jwt.key.pem | nindent 10 }}
+        {{- else if eq .Values.auth.jwt.key.kind "hmacSecret" }}
+        kind: hmac_secret
+        secret: {{ required "auth.jwt.key.secret required when kind=hmacSecret" .Values.auth.jwt.key.secret | quote }}
+        {{- else }}
+        {{- fail (printf "auth.jwt.key.kind must be pemFile|pemInline|hmacSecret, got %q" .Values.auth.jwt.key.kind) }}
+        {{- end }}
+    {{- else if eq .Values.auth.type "oidc" }}
+    auth:
+      type: oidc
+      algorithms:
+        {{- range .Values.auth.oidc.algorithms }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- if .Values.auth.oidc.issuer }}
+      issuer: {{ .Values.auth.oidc.issuer | quote }}
+      {{- end }}
+      {{- if .Values.auth.oidc.audience }}
+      audience: {{ .Values.auth.oidc.audience | quote }}
+      {{- end }}
+      {{- if .Values.auth.oidc.discoveryUrl }}
+      discovery_url: {{ .Values.auth.oidc.discoveryUrl | quote }}
+      {{- end }}
+      {{- if .Values.auth.oidc.jwksUrl }}
+      jwks_url: {{ .Values.auth.oidc.jwksUrl | quote }}
+      {{- end }}
+      user_id_claim: {{ .Values.auth.oidc.userIdClaim | quote }}
+      {{- if .Values.auth.oidc.tenantClaim }}
+      tenant_claim: {{ .Values.auth.oidc.tenantClaim | quote }}
+      {{- end }}
+      {{- if .Values.auth.oidc.groupsClaim }}
+      groups_claim: {{ .Values.auth.oidc.groupsClaim | quote }}
+      {{- end }}
+      refresh_floor_secs: {{ .Values.auth.oidc.refreshFloorSecs }}
+    {{- else }}
+    {{- fail (printf "auth.type must be none|static|jwt|oidc, got %q" .Values.auth.type) }}
+    {{- end }}
+
+    {{- /* ---- affinity store ---- */}}
+    {{- if eq .Values.affinityStore.type "memory" }}
+    {{- if gt (int .Values.replicaCount) 1 }}
+    {{- fail "replicaCount > 1 requires affinityStore.type: redis (memory store is per-pod and breaks session affinity across replicas)" }}
+    {{- end }}
+    affinity_store:
+      type: memory
+    {{- else if eq .Values.affinityStore.type "redis" }}
+    affinity_store:
+      type: redis
+      url: {{ include "scg.redis.url" . | quote }}
+      key_prefix: {{ .Values.affinityStore.redis.keyPrefix | quote }}
+      session_ttl_secs: {{ .Values.affinityStore.redis.sessionTtlSecs }}
+      op_ttl_secs: {{ .Values.affinityStore.redis.opTtlSecs }}
+    {{- else }}
+    {{- fail (printf "affinityStore.type must be memory|redis, got %q" .Values.affinityStore.type) }}
+    {{- end }}
+
+    {{- /* ---- tracing ---- */}}
+    {{- if .Values.tracing.enabled }}
+    tracing:
+      endpoint: {{ .Values.tracing.endpoint | quote }}
+      service_name: {{ .Values.tracing.serviceName | quote }}
+      sample_ratio: {{ .Values.tracing.sampleRatio }}
+      export_timeout_secs: {{ .Values.tracing.exportTimeoutSecs }}
+    {{- end }}

@@ -1,0 +1,174 @@
+# Default values for the spark-connect-gateway Helm chart.
+# All knobs are documented inline. The defaults give you a 2-replica
+# HA gateway in front of a static backend list, with a single-replica
+# bundled Redis providing cross-replica session affinity. No auth, no
+# OTel tracing — both opt-in.
+
+# -- Optional override of the chart name (`{{ .Chart.Name }}`).
+nameOverride: ""
+# -- Override the full release name. Has no default; usually unused.
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/liangchi-hsieh/spark-connect-gateway
+  # -- Image tag. Defaults to the chart's appVersion when null.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # -- Optional image pull secrets, e.g. for private registries.
+  pullSecrets: []
+
+# -- Number of gateway replicas. Multi-replica HA requires
+#    `affinityStore.type: redis` (default), otherwise stickiness
+#    breaks across replicas.
+replicaCount: 2
+
+# -- Resources for the gateway container.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# -- Pod-level scheduling controls.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+
+# Service exposing the gateway externally to clients (and the admin
+# port to Prometheus / probes).
+service:
+  type: ClusterIP
+  # gRPC port consumers connect to via `sc://...:15003`
+  grpcPort: 15003
+  # Admin port: /metrics, /healthz, /readyz
+  adminPort: 9090
+
+# Probes hit the admin port. /readyz returns 200 once the backend
+# pool has at least one entry; /healthz returns 200 unconditionally.
+probes:
+  enabled: true
+  livenessPath: /healthz
+  readinessPath: /readyz
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# -- Backend discovery. `static` is the default; switch to `k8s` to
+#    have the gateway watch a Spark Connect Service's Endpoints object
+#    (the apache/spark-kubernetes-operator pattern).
+backendDiscovery:
+  # `static` or `k8s`
+  type: static
+  # Used when type=static. host:port entries.
+  static:
+    addresses:
+      - "spark-connect-1.svc.cluster.local:15002"
+      - "spark-connect-2.svc.cluster.local:15002"
+  # Used when type=k8s. Watches the named Service's Endpoints.
+  k8s:
+    namespace: spark-connect
+    serviceName: spark-connect
+    port: 15002
+
+# Authentication mode. Defaults to anonymous (no auth) — fine for a
+# trusted in-cluster network, NOT for production exposure.
+auth:
+  # one of: none | static | jwt | oidc
+  type: none
+
+  # type: static — bearer-token allowlist
+  static:
+    tokens: []
+    # - token: "alice-secret"
+    #   userId: "alice"
+    #   tenant: "team-a"
+    #   groups: ["devs"]
+
+  # type: jwt — local-key JWT verification
+  jwt:
+    algorithms: ["RS256"]
+    issuer: ""
+    audience: ""
+    userIdClaim: "sub"
+    tenantClaim: ""
+    groupsClaim: ""
+    # exactly one of {pemFile, pemInline, hmacSecret} required
+    key:
+      kind: pemInline   # pemFile | pemInline | hmacSecret
+      pem: ""           # used when kind=pemInline
+      path: ""          # used when kind=pemFile (path inside the pod)
+      secret: ""        # used when kind=hmacSecret
+
+  # type: oidc — remote JWKS / discovery
+  oidc:
+    algorithms: ["RS256"]
+    issuer: ""
+    audience: ""
+    discoveryUrl: ""    # e.g. https://idp.example.com/.well-known/openid-configuration
+    jwksUrl: ""         # used directly if you don't want discovery
+    userIdClaim: "sub"
+    tenantClaim: ""
+    groupsClaim: ""
+    refreshFloorSecs: 60
+
+# Where the gateway keeps its (user_id, session_id) -> backend
+# affinity table. Multi-replica deployments MUST use `redis` —
+# memory store is per-pod and breaks Spark Connect's session
+# invariant when load balancers fan out across replicas.
+affinityStore:
+  # one of: memory | redis
+  type: redis
+  redis:
+    # Used only when redis.enabled=false (external Redis).
+    # When redis.enabled=true the chart synthesizes the URL from the
+    # bundled StatefulSet; set this to override.
+    url: ""
+    keyPrefix: scg
+    sessionTtlSecs: 3600
+    opTtlSecs: 900
+
+# Bundled Redis StatefulSet. Disable to bring your own (managed
+# Redis, ElastiCache, Bitnami Redis chart, etc.) and set
+# affinityStore.redis.url to point at it.
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 1Gi
+    accessModes:
+      - ReadWriteOnce
+
+# Distributed tracing — exports OTLP/gRPC spans to a collector. Off
+# by default; structured JSON logs work regardless.
+tracing:
+  enabled: false
+  endpoint: "http://otel-collector:4317"
+  serviceName: spark-connect-gateway
+  sampleRatio: 1.0
+  exportTimeoutSecs: 10
+
+# ServiceAccount the gateway pods run under. Auto-created by default;
+# the chart attaches RBAC for endpoints get/list/watch when
+# backendDiscovery.type=k8s.
+serviceAccount:
+  create: true
+  # If empty, the helper derives one from release fullname.
+  name: ""
+  annotations: {}
