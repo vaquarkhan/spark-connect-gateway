@@ -150,6 +150,40 @@ fn default_refresh_floor_secs() -> u64 {
     60
 }
 
+/// Distributed-tracing configuration. Off by default — Phase-1 configs
+/// without a `tracing:` section keep working.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TracingSettings {
+    /// OTLP/gRPC collector endpoint (e.g. `http://otel-collector:4317`).
+    /// `None` disables span export — only the JSON log formatter runs.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// `service.name` resource attribute reported on every span.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// `service.version` resource attribute. Defaults to the
+    /// gateway's compile-time CARGO_PKG_VERSION when omitted.
+    #[serde(default)]
+    pub service_version: Option<String>,
+    /// `TraceIdRatioBased` sampling ratio in `[0.0, 1.0]`. Wrapped in
+    /// `ParentBased` at runtime so a sampled remote parent always wins.
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Per-batch OTLP export deadline, in seconds.
+    #[serde(default = "default_export_timeout_secs")]
+    pub export_timeout_secs: u64,
+}
+
+fn default_service_name() -> String {
+    "spark-connect-gateway".into()
+}
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+fn default_export_timeout_secs() -> u64 {
+    10
+}
+
 /// Raw YAML shape — accepts either the legacy `backends` shorthand or the
 /// tagged `backend_discovery` form, never both.
 #[derive(Debug, Deserialize)]
@@ -166,6 +200,8 @@ struct RawConfig {
     /// Default `0.0.0.0:9090`.
     #[serde(default = "default_admin_addr_opt")]
     admin_addr: Option<String>,
+    #[serde(default)]
+    tracing: Option<TracingSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -179,6 +215,9 @@ pub struct Config {
     pub auth: AuthConfig,
     /// `Some(addr)` to enable the admin HTTP server, `None` to skip it.
     pub admin_addr: Option<String>,
+    /// Distributed-tracing settings. `None` keeps tracing off (the
+    /// gateway only emits structured JSON logs in that case).
+    pub tracing: Option<TracingSettings>,
 }
 
 fn default_bind_addr() -> String {
@@ -228,6 +267,7 @@ impl Config {
             discovery,
             auth: raw.auth.unwrap_or_default(),
             admin_addr: raw.admin_addr.filter(|s| !s.is_empty()),
+            tracing: raw.tracing,
         })
     }
 }
@@ -425,6 +465,54 @@ auth:
             }
             other => panic!("expected Jwt, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn tracing_defaults_to_off() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.tracing.is_none());
+    }
+
+    #[test]
+    fn loads_tracing_block() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+tracing:
+  endpoint: "http://otel-collector:4317"
+  service_name: "scg-staging"
+  sample_ratio: 0.25
+  export_timeout_secs: 5
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        let t = c.tracing.expect("tracing settings parsed");
+        assert_eq!(t.endpoint.as_deref(), Some("http://otel-collector:4317"));
+        assert_eq!(t.service_name, "scg-staging");
+        assert!((t.sample_ratio - 0.25).abs() < 1e-9);
+        assert_eq!(t.export_timeout_secs, 5);
+    }
+
+    #[test]
+    fn tracing_block_endpoint_can_be_omitted_for_log_only() {
+        // A `tracing:` block without an endpoint is legal — the gateway
+        // skips OTLP export but still respects the other knobs (e.g.
+        // service_name) for when the user later sets an endpoint.
+        let f = write(
+            r#"
+backends: ["a:1"]
+tracing:
+  service_name: "scg-test"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        let t = c.tracing.expect("tracing settings parsed");
+        assert!(t.endpoint.is_none());
+        assert_eq!(t.service_name, "scg-test");
+        // Defaults round-trip:
+        assert!((t.sample_ratio - 1.0).abs() < 1e-9);
+        assert_eq!(t.export_timeout_secs, 10);
     }
 
     #[test]

@@ -13,9 +13,16 @@
 
 pub mod admin;
 pub mod metrics;
+pub mod tracing;
 
 pub use admin::{serve_admin, AdminConfig, ReadinessProbe};
 pub use metrics::{Metrics, MetricsError, RpcGuard};
+#[cfg(feature = "testing")]
+pub use tracing::install_test_subscriber;
+pub use tracing::{
+    extract_parent, init_tracing, inject_context, TracingConfig, TracingError, TracingHandle,
+    TRACEPARENT_HEADER, TRACER_NAME,
+};
 
 use uuid::Uuid;
 

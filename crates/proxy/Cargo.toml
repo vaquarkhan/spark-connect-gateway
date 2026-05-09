@@ -19,15 +19,20 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 scg-store-memory = { path = "../store-memory" }
 scg-pool-static = { path = "../pool-static" }
 scg-auth = { path = "../auth" }
-scg-observability = { path = "../observability" }
+scg-observability = { path = "../observability", features = ["testing"] }
 tokio = { workspace = true }
 async-stream = "0.3"
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
+opentelemetry-proto = { workspace = true }
 

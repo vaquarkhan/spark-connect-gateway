@@ -12,10 +12,12 @@ use scg_auth::{
 };
 use scg_config::{
     AuthConfig, BackendDiscovery, Config, JwtSettings, KeySource as CfgKeySource, OidcSettings,
-    TokenEntry as CfgTokenEntry,
+    TokenEntry as CfgTokenEntry, TracingSettings,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
-use scg_observability::{serve_admin, AdminConfig, Metrics, ReadinessProbe};
+use scg_observability::{
+    init_tracing, serve_admin, AdminConfig, Metrics, ReadinessProbe, TracingConfig, TracingHandle,
+};
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
@@ -24,7 +26,6 @@ use scg_store_memory::MemoryStore;
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Open-source Spark Connect Gateway")]
@@ -36,10 +37,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let args = Args::parse();
     let cfg = Config::load(&args.config).with_context(|| format!("loading {}", args.config))?;
+
+    // Tracing must be installed before any other tokio work so the
+    // global subscriber is in place. We also keep the handle alive for
+    // the lifetime of `main` and shut it down explicitly so the OTLP
+    // batch exporter has a chance to flush in-flight spans.
+    let mut tracing_handle = build_tracing(&cfg.tracing)?;
 
     let metrics = Metrics::new().context("building metrics registry")?;
 
@@ -110,6 +115,11 @@ async fn main() -> Result<()> {
     if let Some(h) = admin_handle {
         let _ = h.await;
     }
+
+    // Flush in-flight spans before the process exits. After this call
+    // any further `tracing` events tagged for OTLP export are dropped
+    // (logs still work via the JSON formatter layer).
+    tracing_handle.shutdown();
 
     grpc_result?;
     info!("shutdown complete");
@@ -276,13 +286,22 @@ fn parse_bind_addr(s: &str) -> Result<std::net::SocketAddr> {
         .with_context(|| format!("invalid bind_addr {}", s))
 }
 
-fn init_tracing() {
-    let env = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env)
-        .json()
-        .with_target(false)
-        .init();
+/// Translate the YAML `tracing:` block into the runtime
+/// `TracingConfig`, then install the global subscriber. Returns the
+/// [`TracingHandle`] that the caller keeps alive until shutdown so
+/// in-flight spans get flushed.
+fn build_tracing(settings: &Option<TracingSettings>) -> Result<TracingHandle> {
+    let mut cfg = TracingConfig::default();
+    if let Some(s) = settings {
+        cfg.service_name = s.service_name.clone();
+        if let Some(v) = &s.service_version {
+            cfg.service_version = v.clone();
+        }
+        cfg.endpoint = s.endpoint.clone();
+        cfg.sample_ratio = s.sample_ratio;
+        cfg.export_timeout = std::time::Duration::from_secs(s.export_timeout_secs);
+    }
+    init_tracing(cfg).context("installing tracing subscriber")
 }
 
 async fn shutdown_signal() {

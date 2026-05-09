@@ -5,14 +5,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
+use opentelemetry::trace::TraceContextExt;
 use scg_auth::{AnonymousAuthenticator, AuthInterceptor, Identity};
 use scg_genproto::pb;
-use scg_observability::{request_id, Metrics, RpcGuard, REQUEST_ID_HEADER};
+use scg_observability::{
+    extract_parent, inject_context, request_id, Metrics, RpcGuard, REQUEST_ID_HEADER,
+};
 use scg_routing::{Router, SessionKey};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::dial::Dialer;
 
@@ -190,6 +194,46 @@ fn stamp_request_id<T>(req: &mut Request<T>, request_id: &str) {
     }
 }
 
+/// Build a per-RPC tracing span and parent it to whatever traceparent
+/// the inbound metadata carries (no-op when absent — the span becomes a
+/// fresh trace root).
+///
+/// Returns the span; the caller `Instrument`s the handler future with
+/// it. Span name follows the OpenTelemetry semantic-conventions form
+/// `<service>/<rpc>` so distributed-trace UIs render it nicely.
+fn rpc_span(rpc: &'static str, rid: &str, inbound: &MetadataMap) -> Span {
+    // Field names use underscores rather than dots: Span attribute
+    // names with `.` round-trip through tracing-opentelemetry, but
+    // some feature combos in the dependency graph silently drop them
+    // before they reach the OTel exporter. Use snake_case here and
+    // map to the dotted OTel semantic-conventions name in
+    // post-processing if needed.
+    let span = tracing::info_span!(
+        "scg_rpc",
+        rpc_method = rpc,
+        rpc_system = "grpc",
+        rpc_service = "spark.connect.SparkConnectService",
+        scg_rid = %rid,
+    );
+    let parent_cx = extract_parent(inbound);
+    if parent_cx.span().span_context().is_valid() {
+        // Failure here just means the OTel layer isn't installed
+        // (e.g. tracing is disabled in config) — the span is still
+        // useful for the JSON formatter, so we silently ignore.
+        let _ = span.set_parent(parent_cx);
+    }
+    span
+}
+
+/// Stamp both the gateway's correlation ID and the current span's
+/// W3C traceparent onto an outbound request — backend logs / spans
+/// can now join the same trace as the gateway.
+fn stamp_propagation<T>(req: &mut Request<T>, request_id: &str) {
+    stamp_request_id(req, request_id);
+    let cx = Span::current().context();
+    inject_context(&cx, req.metadata_mut());
+}
+
 /// Update an `RpcGuard` with the final code from a `Status` (or "OK"
 /// when the result is Ok).
 fn finalise_guard<T>(guard: &mut RpcGuard, result: &Result<T, Status>) {
@@ -218,6 +262,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::AnalyzePlanResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("AnalyzePlan");
         let rid = request_id();
+        let span = rpc_span("AnalyzePlan", &rid, req.metadata());
         let result: Result<Response<pb::AnalyzePlanResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -227,9 +272,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             info!(rid = %rid, rpc = "AnalyzePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.analyze_plan(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -241,6 +287,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ConfigResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("Config");
         let rid = request_id();
+        let span = rpc_span("Config", &rid, req.metadata());
         let result: Result<Response<pb::ConfigResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -250,9 +297,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             info!(rid = %rid, rpc = "Config", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.config(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -264,6 +312,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ArtifactStatusesResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("ArtifactStatus");
         let rid = request_id();
+        let span = rpc_span("ArtifactStatus", &rid, req.metadata());
         let result: Result<Response<pb::ArtifactStatusesResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -272,9 +321,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_session(&key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.artifact_status(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -286,6 +336,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::InterruptResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("Interrupt");
         let rid = request_id();
+        let span = rpc_span("Interrupt", &rid, req.metadata());
         let result: Result<Response<pb::InterruptResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -300,9 +351,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.interrupt(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -314,6 +366,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ReleaseExecuteResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("ReleaseExecute");
         let rid = request_id();
+        let span = rpc_span("ReleaseExecute", &rid, req.metadata());
         let result: Result<Response<pb::ReleaseExecuteResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -323,13 +376,14 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             let resp = c.release_execute(outbound).await?;
             // On a successful release the server has dropped the operation, so
             // we drop our reverse-index entry too.
             self.router.forget_op(&op_id);
             Ok(resp)
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -341,6 +395,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::ReleaseSessionResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("ReleaseSession");
         let rid = request_id();
+        let span = rpc_span("ReleaseSession", &rid, req.metadata());
         let result: Result<Response<pb::ReleaseSessionResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -349,11 +404,12 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_session(&key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             let resp = c.release_session(outbound).await?;
             self.router.forget_session(&key);
             Ok(resp)
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -365,6 +421,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::FetchErrorDetailsResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("FetchErrorDetails");
         let rid = request_id();
+        let span = rpc_span("FetchErrorDetails", &rid, req.metadata());
         let result: Result<Response<pb::FetchErrorDetailsResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -373,9 +430,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_session(&key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.fetch_error_details(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -387,6 +445,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::CloneSessionResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("CloneSession");
         let rid = request_id();
+        let span = rpc_span("CloneSession", &rid, req.metadata());
         let result: Result<Response<pb::CloneSessionResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -395,9 +454,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_session(&key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.clone_session(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -409,6 +469,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
         let mut guard = self.metrics.rpc_guard("GetStatus");
         let rid = request_id();
+        let span = rpc_span("GetStatus", &rid, req.metadata());
         let result: Result<Response<pb::GetStatusResponse>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -417,9 +478,10 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_session(&key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             c.get_status(outbound).await
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -434,6 +496,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         let mut guard = self.metrics.rpc_guard("ExecutePlan");
         let _stream_guard = self.metrics.stream_guard();
         let rid = request_id();
+        let span = rpc_span("ExecutePlan", &rid, req.metadata());
         let result: Result<Response<Self::ExecutePlanStream>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -453,10 +516,11 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
 
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             let upstream = c.execute_plan(outbound).await?.into_inner();
             Ok(Response::new(forward_server_stream(upstream)))
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -469,6 +533,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         let mut guard = self.metrics.rpc_guard("ReattachExecute");
         let _stream_guard = self.metrics.stream_guard();
         let rid = request_id();
+        let span = rpc_span("ReattachExecute", &rid, req.metadata());
         let result: Result<Response<Self::ReattachExecuteStream>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -477,10 +542,11 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             let upstream = c.reattach_execute(outbound).await?.into_inner();
             Ok(Response::new(forward_server_stream(upstream)))
         }
+        .instrument(span)
         .await;
         finalise_guard(&mut guard, &result);
         result
@@ -495,6 +561,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         let mut guard = self.metrics.rpc_guard("AddArtifacts");
         let _stream_guard = self.metrics.stream_guard();
         let rid = request_id();
+        let span = rpc_span("AddArtifacts", &rid, req.metadata());
         let result: Result<Response<pb::AddArtifactsResponse>, Status> = async {
             // Authenticate from the request metadata before we touch the
             // streaming body — the credential lives in HTTP/2 headers, not
@@ -528,10 +595,11 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             });
 
             let mut outbound = Request::new(ReceiverStream::new(rx));
-            stamp_request_id(&mut outbound, &rid);
+            stamp_propagation(&mut outbound, &rid);
             let resp = c.add_artifacts(outbound).await?;
             Ok(resp)
         }
+        .instrument(span)
         .await;
         if let Err(ref e) = result {
             warn!(rid = %rid, error = %e, "AddArtifacts failed");
