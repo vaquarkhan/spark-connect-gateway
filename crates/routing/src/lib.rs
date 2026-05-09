@@ -60,17 +60,24 @@ pub trait Pool: Send + Sync + 'static {
 }
 
 /// Persistence layer for sticky routing decisions. Phase 1 ships an
-/// in-memory implementation; Phase 2 swaps in Redis / Postgres for HA.
+/// in-memory implementation; Phase 2 swaps in Redis (and optionally
+/// Postgres) so multiple gateway replicas share affinity.
+///
+/// The trait is `async_trait` because Phase 2 backings (Redis,
+/// Postgres) are network calls. The in-memory Phase 1 impl wraps its
+/// sync work in async fn signatures with no `await` points, so
+/// callers pay only the trait-object dispatch cost.
+#[async_trait::async_trait]
 pub trait AffinityStore: Send + Sync + 'static {
-    fn lookup_session(&self, key: &SessionKey) -> Option<String>;
+    async fn lookup_session(&self, key: &SessionKey) -> Option<String>;
     /// Insert `(key, backend)` only if no binding for `key` exists.
     /// Returns the *winning* binding (existing or freshly inserted).
-    fn bind_session_if_absent(&self, key: SessionKey, backend: String) -> String;
-    fn forget_session(&self, key: &SessionKey);
+    async fn bind_session_if_absent(&self, key: SessionKey, backend: String) -> String;
+    async fn forget_session(&self, key: &SessionKey);
 
-    fn lookup_op(&self, op_id: &str) -> Option<String>;
-    fn bind_op(&self, op_id: String, backend: String);
-    fn forget_op(&self, op_id: &str);
+    async fn lookup_op(&self, op_id: &str) -> Option<String>;
+    async fn bind_op(&self, op_id: String, backend: String);
+    async fn forget_op(&self, op_id: &str);
 }
 
 /// Resolves a request to a concrete backend address.
@@ -93,15 +100,15 @@ impl Router {
     /// A `SessionKey` with an empty `session_id` falls through to a fresh
     /// pick, but that binding is *not* recorded — without a stable session
     /// id we cannot honour stickiness on the next call.
-    pub fn resolve_session(&self, key: &SessionKey) -> Option<String> {
+    pub async fn resolve_session(&self, key: &SessionKey) -> Option<String> {
         if key.is_zero() {
             return self.pool.pick();
         }
-        if let Some(existing) = self.store.lookup_session(key) {
+        if let Some(existing) = self.store.lookup_session(key).await {
             return Some(existing);
         }
         let chosen = self.pool.pick()?;
-        Some(self.store.bind_session_if_absent(key.clone(), chosen))
+        Some(self.store.bind_session_if_absent(key.clone(), chosen).await)
     }
 
     /// Resolve a backend for an operation, falling back to session routing
@@ -112,13 +119,13 @@ impl Router {
     /// specific backend, and the gateway must route back to that same
     /// backend even if the affinity cache for the session has already
     /// expired or is missing.
-    pub fn resolve_op(&self, op_id: &str, key: &SessionKey) -> Option<String> {
+    pub async fn resolve_op(&self, op_id: &str, key: &SessionKey) -> Option<String> {
         if !op_id.is_empty() {
-            if let Some(b) = self.store.lookup_op(op_id) {
+            if let Some(b) = self.store.lookup_op(op_id).await {
                 return Some(b);
             }
         }
-        self.resolve_session(key)
+        self.resolve_session(key).await
     }
 
     /// Hint to the pool that `addr` is currently unreachable.
@@ -126,22 +133,22 @@ impl Router {
         self.pool.mark_unhealthy(addr);
     }
 
-    pub fn remember_op(&self, op_id: String, backend: String) {
+    pub async fn remember_op(&self, op_id: String, backend: String) {
         if op_id.is_empty() {
             return;
         }
-        self.store.bind_op(op_id, backend);
+        self.store.bind_op(op_id, backend).await;
     }
 
-    pub fn forget_op(&self, op_id: &str) {
+    pub async fn forget_op(&self, op_id: &str) {
         if op_id.is_empty() {
             return;
         }
-        self.store.forget_op(op_id);
+        self.store.forget_op(op_id).await;
     }
 
-    pub fn forget_session(&self, key: &SessionKey) {
-        self.store.forget_session(key);
+    pub async fn forget_session(&self, key: &SessionKey) {
+        self.store.forget_session(key).await;
     }
 }
 
@@ -189,24 +196,25 @@ mod tests {
             }
         }
     }
+    #[async_trait::async_trait]
     impl AffinityStore for StubStore {
-        fn lookup_session(&self, k: &SessionKey) -> Option<String> {
+        async fn lookup_session(&self, k: &SessionKey) -> Option<String> {
             self.sessions.lock().get(k).cloned()
         }
-        fn bind_session_if_absent(&self, k: SessionKey, v: String) -> String {
+        async fn bind_session_if_absent(&self, k: SessionKey, v: String) -> String {
             let mut g = self.sessions.lock();
             g.entry(k).or_insert(v).clone()
         }
-        fn forget_session(&self, k: &SessionKey) {
+        async fn forget_session(&self, k: &SessionKey) {
             self.sessions.lock().remove(k);
         }
-        fn lookup_op(&self, o: &str) -> Option<String> {
+        async fn lookup_op(&self, o: &str) -> Option<String> {
             self.ops.lock().get(o).cloned()
         }
-        fn bind_op(&self, o: String, v: String) {
+        async fn bind_op(&self, o: String, v: String) {
             self.ops.lock().insert(o, v);
         }
-        fn forget_op(&self, o: &str) {
+        async fn forget_op(&self, o: &str) {
             self.ops.lock().remove(o);
         }
     }
@@ -220,26 +228,26 @@ mod tests {
         )
     }
 
-    #[test]
-    fn stickiness_is_honoured() {
+    #[tokio::test]
+    async fn stickiness_is_honoured() {
         let r = router();
         let k = SessionKey::new("u1", "s1");
-        let first = r.resolve_session(&k);
+        let first = r.resolve_session(&k).await;
         for _ in 0..10 {
-            assert_eq!(r.resolve_session(&k), first);
+            assert_eq!(r.resolve_session(&k).await, first);
         }
     }
 
-    #[test]
-    fn distinct_sessions_can_diverge() {
+    #[tokio::test]
+    async fn distinct_sessions_can_diverge() {
         let r = router();
-        let a = r.resolve_session(&SessionKey::new("u1", "s1"));
-        let b = r.resolve_session(&SessionKey::new("u1", "s2"));
+        let a = r.resolve_session(&SessionKey::new("u1", "s1")).await;
+        let b = r.resolve_session(&SessionKey::new("u1", "s2")).await;
         assert_ne!(a, b, "round-robin should diverge across sessions");
     }
 
-    #[test]
-    fn empty_session_does_not_bind() {
+    #[tokio::test]
+    async fn empty_session_does_not_bind() {
         let store = Arc::new(StubStore::default());
         let r = Router::new(
             Arc::new(SeqPool {
@@ -247,26 +255,31 @@ mod tests {
             }),
             store.clone() as Arc<dyn AffinityStore>,
         );
-        r.resolve_session(&SessionKey::new("u", ""));
+        r.resolve_session(&SessionKey::new("u", "")).await;
         assert!(store
             .lookup_session(&SessionKey::new("u", "anything"))
+            .await
             .is_none());
     }
 
-    #[test]
-    fn op_lookup_overrides_session() {
+    #[tokio::test]
+    async fn op_lookup_overrides_session() {
         let r = router();
         let k = SessionKey::new("u", "s");
-        let _first = r.resolve_op("op-unknown", &k);
-        r.remember_op("op-1".to_string(), "explicit:1".to_string());
-        assert_eq!(r.resolve_op("op-1", &k).as_deref(), Some("explicit:1"));
+        let _first = r.resolve_op("op-unknown", &k).await;
+        r.remember_op("op-1".to_string(), "explicit:1".to_string())
+            .await;
+        assert_eq!(
+            r.resolve_op("op-1", &k).await.as_deref(),
+            Some("explicit:1")
+        );
     }
 
-    #[test]
-    fn empty_pool_returns_none() {
+    #[tokio::test]
+    async fn empty_pool_returns_none() {
         let r = Router::new(Arc::new(EmptyPool), Arc::new(StubStore::default()));
         let k = SessionKey::new("u", "s");
-        assert!(r.resolve_session(&k).is_none());
-        assert!(r.resolve_op("op", &k).is_none());
+        assert!(r.resolve_session(&k).await.is_none());
+        assert!(r.resolve_op("op", &k).await.is_none());
     }
 }

@@ -20,29 +20,30 @@ impl MemoryStore {
     }
 }
 
+#[async_trait::async_trait]
 impl AffinityStore for MemoryStore {
-    fn lookup_session(&self, key: &SessionKey) -> Option<String> {
+    async fn lookup_session(&self, key: &SessionKey) -> Option<String> {
         self.sessions.read().get(key).cloned()
     }
 
-    fn bind_session_if_absent(&self, key: SessionKey, backend: String) -> String {
+    async fn bind_session_if_absent(&self, key: SessionKey, backend: String) -> String {
         let mut g = self.sessions.write();
         g.entry(key).or_insert(backend).clone()
     }
 
-    fn forget_session(&self, key: &SessionKey) {
+    async fn forget_session(&self, key: &SessionKey) {
         self.sessions.write().remove(key);
     }
 
-    fn lookup_op(&self, op_id: &str) -> Option<String> {
+    async fn lookup_op(&self, op_id: &str) -> Option<String> {
         self.ops.read().get(op_id).cloned()
     }
 
-    fn bind_op(&self, op_id: String, backend: String) {
+    async fn bind_op(&self, op_id: String, backend: String) {
         self.ops.write().insert(op_id, backend);
     }
 
-    fn forget_op(&self, op_id: &str) {
+    async fn forget_op(&self, op_id: &str) {
         self.ops.write().remove(op_id);
     }
 }
@@ -51,27 +52,31 @@ impl AffinityStore for MemoryStore {
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_stickiness_invariant() {
+    #[tokio::test]
+    async fn session_stickiness_invariant() {
         let s = MemoryStore::new();
         let k = SessionKey::new("alice", "sess-1");
-        assert!(s.lookup_session(&k).is_none());
-        let first = s.bind_session_if_absent(k.clone(), "be-a:15002".into());
+        assert!(s.lookup_session(&k).await.is_none());
+        let first = s
+            .bind_session_if_absent(k.clone(), "be-a:15002".into())
+            .await;
         assert_eq!(first, "be-a:15002");
         // Re-binding must not move an existing session — stickiness invariant.
-        let second = s.bind_session_if_absent(k.clone(), "be-b:15002".into());
+        let second = s
+            .bind_session_if_absent(k.clone(), "be-b:15002".into())
+            .await;
         assert_eq!(second, "be-a:15002");
-        s.forget_session(&k);
-        assert!(s.lookup_session(&k).is_none());
+        s.forget_session(&k).await;
+        assert!(s.lookup_session(&k).await.is_none());
     }
 
-    #[test]
-    fn op_reverse_index() {
+    #[tokio::test]
+    async fn op_reverse_index() {
         let s = MemoryStore::new();
-        assert!(s.lookup_op("op-1").is_none());
-        s.bind_op("op-1".into(), "be-a:15002".into());
-        assert_eq!(s.lookup_op("op-1").as_deref(), Some("be-a:15002"));
-        s.forget_op("op-1");
-        assert!(s.lookup_op("op-1").is_none());
+        assert!(s.lookup_op("op-1").await.is_none());
+        s.bind_op("op-1".into(), "be-a:15002".into()).await;
+        assert_eq!(s.lookup_op("op-1").await.as_deref(), Some("be-a:15002"));
+        s.forget_op("op-1").await;
+        assert!(s.lookup_op("op-1").await.is_none());
     }
 }

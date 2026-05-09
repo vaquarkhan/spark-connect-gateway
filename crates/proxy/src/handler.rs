@@ -268,7 +268,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             info!(rid = %rid, rpc = "AnalyzePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
@@ -293,7 +293,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             info!(rid = %rid, rpc = "Config", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
@@ -318,7 +318,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -348,7 +348,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
                 Some(pb::interrupt_request::Interrupt::OperationId(id)) => id.clone(),
                 _ => String::new(),
             };
-            let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
+            let addr = require_addr(self.router.resolve_op(&op_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -373,14 +373,14 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
             let op_id = body.operation_id.clone();
-            let addr = require_addr(self.router.resolve_op(&op_id, &key))?;
+            let addr = require_addr(self.router.resolve_op(&op_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
             let resp = c.release_execute(outbound).await?;
             // On a successful release the server has dropped the operation, so
             // we drop our reverse-index entry too.
-            self.router.forget_op(&op_id);
+            self.router.forget_op(&op_id).await;
             Ok(resp)
         }
         .instrument(span)
@@ -401,12 +401,12 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
             let resp = c.release_session(outbound).await?;
-            self.router.forget_session(&key);
+            self.router.forget_session(&key).await;
             Ok(resp)
         }
         .instrument(span)
@@ -427,7 +427,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -451,7 +451,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -475,7 +475,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -502,7 +502,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             info!(rid = %rid, rpc = "ExecutePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding stream");
 
             // Bind operation_id → backend so a follow-up ReattachExecute reaches
@@ -510,7 +510,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             // forgotten by the affinity cache.
             if let Some(op_id) = body.operation_id.clone() {
                 if !op_id.is_empty() {
-                    self.router.remember_op(op_id, addr.clone());
+                    self.router.remember_op(op_id, addr.clone()).await;
                 }
             }
 
@@ -539,7 +539,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut body = req.into_inner();
             stamp_user_context(&mut body.user_context, &identity);
             let key = key_from_identity(&body.session_id, &identity);
-            let addr = require_addr(self.router.resolve_op(&body.operation_id, &key))?;
+            let addr = require_addr(self.router.resolve_op(&body.operation_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
@@ -578,7 +578,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             stamp_user_context(&mut first.user_context, &identity);
 
             let key = key_from_identity(&first.session_id, &identity);
-            let addr = require_addr(self.router.resolve_session(&key))?;
+            let addr = require_addr(self.router.resolve_session(&key).await)?;
             let mut c = self.client(&addr)?;
 
             let (tx, rx) = tokio::sync::mpsc::channel::<pb::AddArtifactsRequest>(8);

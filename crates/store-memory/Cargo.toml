@@ -8,3 +8,7 @@ publish = false
 [dependencies]
 scg-routing = { path = "../routing" }
 parking_lot = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
