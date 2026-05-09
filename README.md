@@ -101,6 +101,45 @@ Per-RPC structured logs include a correlation ID (`rid`); the same
 ID is forwarded to the backend via `x-request-id` metadata so backend
 logs can be joined.
 
+#### Distributed tracing (OTLP)
+
+Off by default. Add a `tracing:` block to enable OpenTelemetry span
+export to an OTLP/gRPC collector:
+
+```yaml
+tracing:
+  endpoint: "http://otel-collector:4317"
+  service_name: "spark-connect-gateway"
+  sample_ratio: 1.0           # ParentBased(TraceIdRatioBased(N))
+  export_timeout_secs: 10
+```
+
+Each RPC opens an `info`-level `scg_rpc` span carrying
+`rpc_method`, `rpc_system="grpc"`, `rpc_service`, and the same
+`scg_rid` correlation ID surfaced in the JSON logs. Inbound W3C
+`traceparent` metadata becomes the parent of that span; the gateway
+re-injects its own `traceparent` (alongside `x-request-id`) on the
+outbound request, so a Spark Connect server that participates in
+tracing joins the same trace.
+
+When the `endpoint` is omitted or the whole `tracing:` block is
+absent, the gateway runs with structured JSON logs only — no OTel
+SDK is initialized.
+
+> **Known limitation (root spans only).** Today, only RPCs where the
+> gateway is the trace root (no inbound `traceparent`) export their
+> spans reliably end-to-end via OTLP. RPCs that arrive *with* a W3C
+> `traceparent` set by an upstream caller continue to log to JSON
+> (with the inbound `scg_rid` correlation ID), but their `scg_rpc`
+> span is dropped before reaching the OTLP exporter due to a
+> versioning mismatch in the `tracing-opentelemetry` ↔
+> `opentelemetry_sdk` interaction around `Context::with_remote_span_context`.
+> Tracking upstream — distributed-trace continuity from upstream
+> caller → gateway → backend will return once the SDK fix lands; the
+> gateway → backend hop already injects `traceparent` correctly so
+> the backend half of the trace will start working as soon as the
+> gateway-side path is fixed.
+
 Scrape config example for Prometheus:
 
 ```yaml
