@@ -19,3 +19,16 @@ backends:
 #   namespace: spark-connect
 #   service_name: spark-connect
 #   port: 15002
+
+# Where to keep the (user_id, session_id) -> backend affinity table.
+# Default `memory` works for a single gateway replica. For replicas > 1
+# (HA / multi-pod deployments), point at a Redis instance so all
+# replicas see the same bindings — without it, a client that lands on
+# a different replica gets re-bound to a different backend.
+#
+# affinity_store:
+#   type: redis
+#   url: "redis://redis-cluster:6379"  # supports redis://:pw@host:6379/2
+#   key_prefix: "scg"                   # default "scg"
+#   session_ttl_secs: 3600              # default 1h, refreshed on reads
+#   op_ttl_secs: 900                    # default 15min

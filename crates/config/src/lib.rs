@@ -150,6 +150,48 @@ fn default_refresh_floor_secs() -> u64 {
     60
 }
 
+/// Where the gateway keeps its `(user_id, session_id) -> backend`
+/// affinity table. Default `memory` keeps the Phase-1 in-process
+/// behaviour. `redis` is required for HA across multiple gateway
+/// replicas — without it, two replicas will pin the same session to
+/// different backends and Spark Connect's per-driver session state
+/// stops being consistent.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AffinityStoreConfig {
+    #[default]
+    Memory,
+    Redis(RedisStoreSettings),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RedisStoreSettings {
+    /// `redis://` URL. Supports password (`redis://:pw@host:6379`)
+    /// and database index (`redis://host:6379/2`).
+    pub url: String,
+    /// Key prefix; lets multiple gateway deployments share a Redis
+    /// without colliding. Default `scg`.
+    #[serde(default = "default_redis_prefix")]
+    pub key_prefix: String,
+    /// TTL for `(user_id, session_id) -> backend` bindings (seconds).
+    /// Refreshed on every read.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// TTL for `op_id -> backend` bindings (seconds).
+    #[serde(default = "default_op_ttl_secs")]
+    pub op_ttl_secs: u64,
+}
+
+fn default_redis_prefix() -> String {
+    "scg".into()
+}
+fn default_session_ttl_secs() -> u64 {
+    60 * 60
+}
+fn default_op_ttl_secs() -> u64 {
+    15 * 60
+}
+
 /// Distributed-tracing configuration. Off by default — Phase-1 configs
 /// without a `tracing:` section keep working.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -202,6 +244,8 @@ struct RawConfig {
     admin_addr: Option<String>,
     #[serde(default)]
     tracing: Option<TracingSettings>,
+    #[serde(default)]
+    affinity_store: Option<AffinityStoreConfig>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -218,6 +262,9 @@ pub struct Config {
     /// Distributed-tracing settings. `None` keeps tracing off (the
     /// gateway only emits structured JSON logs in that case).
     pub tracing: Option<TracingSettings>,
+    /// Where to keep affinity state. Defaults to in-memory; use
+    /// `redis` for multi-replica HA.
+    pub affinity_store: AffinityStoreConfig,
 }
 
 fn default_bind_addr() -> String {
@@ -268,6 +315,7 @@ impl Config {
             auth: raw.auth.unwrap_or_default(),
             admin_addr: raw.admin_addr.filter(|s| !s.is_empty()),
             tracing: raw.tracing,
+            affinity_store: raw.affinity_store.unwrap_or_default(),
         })
     }
 }
@@ -513,6 +561,59 @@ tracing:
         // Defaults round-trip:
         assert!((t.sample_ratio - 1.0).abs() < 1e-9);
         assert_eq!(t.export_timeout_secs, 10);
+    }
+
+    #[test]
+    fn affinity_store_defaults_to_memory() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(matches!(c.affinity_store, AffinityStoreConfig::Memory));
+    }
+
+    #[test]
+    fn loads_redis_affinity_store() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+affinity_store:
+  type: redis
+  url: "redis://redis-cluster:6379"
+  key_prefix: "scg-prod"
+  session_ttl_secs: 7200
+  op_ttl_secs: 600
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.affinity_store {
+            AffinityStoreConfig::Redis(s) => {
+                assert_eq!(s.url, "redis://redis-cluster:6379");
+                assert_eq!(s.key_prefix, "scg-prod");
+                assert_eq!(s.session_ttl_secs, 7200);
+                assert_eq!(s.op_ttl_secs, 600);
+            }
+            other => panic!("expected Redis, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn redis_affinity_store_has_sane_defaults() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+affinity_store:
+  type: redis
+  url: "redis://localhost:6379"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.affinity_store {
+            AffinityStoreConfig::Redis(s) => {
+                assert_eq!(s.key_prefix, "scg");
+                assert_eq!(s.session_ttl_secs, 3600);
+                assert_eq!(s.op_ttl_secs, 900);
+            }
+            other => panic!("expected Redis, got {:?}", other),
+        }
     }
 
     #[test]

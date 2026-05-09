@@ -11,8 +11,9 @@ use scg_auth::{
     AnonymousAuthenticator, AuthInterceptor, Authenticator, JwtAuthenticator, OidcAuthenticator,
 };
 use scg_config::{
-    AuthConfig, BackendDiscovery, Config, JwtSettings, KeySource as CfgKeySource, OidcSettings,
-    TokenEntry as CfgTokenEntry, TracingSettings,
+    AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, JwtSettings,
+    KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TokenEntry as CfgTokenEntry,
+    TracingSettings,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_observability::{
@@ -23,6 +24,7 @@ use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
 use scg_routing::{AffinityStore, Pool, Router};
 use scg_store_memory::MemoryStore;
+use scg_store_redis::{RedisStore, RedisStoreConfig};
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
     let readiness = ReadinessProbe::default();
 
     let (pool, _watcher) = build_pool(&cfg.discovery, &metrics, &readiness).await?;
-    let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
+    let store = build_affinity_store(&cfg.affinity_store).await?;
     let router = Arc::new(Router::new(pool, store));
     let dialer = Dialer::new();
 
@@ -172,6 +174,30 @@ async fn build_pool(
     }
 }
 
+/// Build the configured `AffinityStore`. Memory is in-process and
+/// always succeeds; Redis dials the URL eagerly so misconfiguration
+/// surfaces at startup, not at the first inbound RPC.
+async fn build_affinity_store(cfg: &AffinityStoreConfig) -> Result<Arc<dyn AffinityStore>> {
+    match cfg {
+        AffinityStoreConfig::Memory => Ok(Arc::new(MemoryStore::new())),
+        AffinityStoreConfig::Redis(s) => {
+            let store = RedisStore::connect(redis_store_config(s))
+                .await
+                .with_context(|| format!("connecting to redis at {}", s.url))?;
+            Ok(Arc::new(store))
+        }
+    }
+}
+
+fn redis_store_config(s: &RedisStoreSettings) -> RedisStoreConfig {
+    RedisStoreConfig {
+        url: s.url.clone(),
+        key_prefix: s.key_prefix.clone(),
+        session_ttl: std::time::Duration::from_secs(s.session_ttl_secs),
+        op_ttl: std::time::Duration::from_secs(s.op_ttl_secs),
+    }
+}
+
 /// Construct the right Authenticator from config.
 async fn build_auth(cfg: &AuthConfig) -> Result<Arc<dyn Authenticator>> {
     match cfg {
@@ -245,6 +271,10 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
         AuthConfig::Jwt(_) => "jwt",
         AuthConfig::Oidc(_) => "oidc",
     };
+    let store_kind = match &cfg.affinity_store {
+        AffinityStoreConfig::Memory => "memory",
+        AffinityStoreConfig::Redis(_) => "redis",
+    };
     match &cfg.discovery {
         BackendDiscovery::Static { addresses } => {
             info!(
@@ -252,6 +282,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 %addr,
                 discovery = "static",
                 auth = auth_kind,
+                affinity_store = store_kind,
                 backends = ?addresses,
                 "spark-connect-gateway starting"
             );
@@ -266,6 +297,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 %addr,
                 discovery = "k8s",
                 auth = auth_kind,
+                affinity_store = store_kind,
                 namespace = %namespace,
                 service = %service_name,
                 port,

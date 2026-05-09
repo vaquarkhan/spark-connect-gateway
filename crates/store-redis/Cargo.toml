@@ -1,0 +1,18 @@
+[package]
+name = "scg-store-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-routing = { path = "../routing" }
+async-trait = { workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+testcontainers-modules = { workspace = true }

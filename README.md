@@ -202,6 +202,48 @@ spark = SparkSession.builder.remote(
 ).getOrCreate()
 ```
 
+### Sharing affinity across gateway replicas (Redis)
+
+The default in-memory affinity store works only for a single gateway
+replica — every replica keeps its own `(user_id, session_id) -> backend`
+table, so a client that lands on replica B after replica A bound it
+to backend X gets re-bound to a different backend, breaking the
+Spark Connect per-driver session invariant.
+
+To run the gateway with `replicas > 1` (e.g. behind a Kubernetes
+`Service` for HA), point the gateway at a Redis instance:
+
+```yaml
+bind_addr: ":15003"
+backends: ["spark-connect-1:15002", "spark-connect-2:15002"]
+
+affinity_store:
+  type: redis
+  url: "redis://redis-cluster:6379"        # supports redis://:pw@host:6379/2
+  key_prefix: "scg-prod"                   # default "scg"
+  session_ttl_secs: 3600                   # default 1h, refreshed on reads
+  op_ttl_secs: 900                         # default 15min
+```
+
+Both stickiness invariants are preserved across replicas:
+
+* `bind_session_if_absent` uses Redis `SET … NX EX` — when two
+  replicas race on the same session, exactly one wins; the loser
+  reads the winner's value back and routes to the same backend.
+* The op-id reverse index (used by `ReattachExecute` /
+  `ReleaseExecute` / `Interrupt`) lives in `{prefix}:o:{op_id}`,
+  so a client reconnecting through a different replica still
+  reaches the original driver.
+
+If Redis becomes unreachable, the gateway logs `warn!` per failed
+operation and degrades to pool-only routing — sessions land on
+whatever backend the pool picks each time, which is exactly the
+Phase-1 in-memory behaviour seen by a single replica. Service
+remains available; HA stickiness recovers as soon as Redis does.
+
+`affinity_store` defaults to `type: memory` (no entry needed),
+matching Phase-1 behaviour.
+
 ### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
