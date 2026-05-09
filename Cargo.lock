@@ -2653,6 +2653,7 @@ dependencies = [
  "scg-pool-static",
  "scg-routing",
  "scg-store-memory",
+ "scg-store-redis",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

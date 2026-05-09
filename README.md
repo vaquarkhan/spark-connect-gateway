@@ -244,6 +244,31 @@ remains available; HA stickiness recovers as soon as Redis does.
 `affinity_store` defaults to `type: memory` (no entry needed),
 matching Phase-1 behaviour.
 
+#### Verifying HA locally
+
+`crates/proxy/examples/ha_smoke.rs` spins up two real
+`SparkConnectProxy` instances backed by one Redis and a shared pool
+of fake backends, then drives RPCs through different replicas to
+prove three invariants:
+
+* **Shared state** — a session bound through replica A resolves to
+  the same backend through replica B.
+* **Failover** — after replica A is killed, the same session through
+  replica B still hits the original backend.
+* **Op-id reverse index across replicas** — `ReattachExecute(op_id,
+  session_id="different")` arriving at replica B (after A is gone)
+  still reaches the backend that ran the original `ExecutePlan`.
+
+Run with a Redis listening on `:6399` (or override via `REDIS_URL`):
+
+```bash
+redis-server --port 6399 --daemonize yes
+cargo run -p scg-proxy --example ha_smoke
+```
+
+Exits zero on success; panics with a descriptive assertion message
+on any failure, so a CI script can wrap it directly.
+
 ### Run on Kubernetes (auto-discovery)
 
 See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
