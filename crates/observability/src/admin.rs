@@ -55,6 +55,13 @@ impl ReadinessProbe {
     pub fn mark_ready(&self) {
         self.inner.store(true, std::sync::atomic::Ordering::Release);
     }
+    /// Flip readiness back to false. Used during drain on SIGTERM so
+    /// `/readyz` returns 503 and Kubernetes removes this pod from the
+    /// Service endpoints before any in-flight RPCs are torn down.
+    pub fn mark_not_ready(&self) {
+        self.inner
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
     pub fn is_ready(&self) -> bool {
         self.inner.load(std::sync::atomic::Ordering::Acquire)
     }

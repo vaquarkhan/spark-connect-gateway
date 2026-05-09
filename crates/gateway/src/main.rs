@@ -11,11 +11,12 @@ use scg_auth::{
     AnonymousAuthenticator, AuthInterceptor, Authenticator, JwtAuthenticator, OidcAuthenticator,
 };
 use scg_config::{
-    AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, JwtSettings,
+    AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, HealthCheckSettings, JwtSettings,
     KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TokenEntry as CfgTokenEntry,
     TracingSettings,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
+use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
 use scg_observability::{
     init_tracing, serve_admin, AdminConfig, Metrics, ReadinessProbe, TracingConfig, TracingHandle,
 };
@@ -27,7 +28,7 @@ use scg_store_memory::MemoryStore;
 use scg_store_redis::{RedisStore, RedisStoreConfig};
 use tokio::sync::watch;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Open-source Spark Connect Gateway")]
@@ -57,6 +58,10 @@ async fn main() -> Result<()> {
     let readiness = ReadinessProbe::default();
 
     let (pool, _watcher) = build_pool(&cfg.discovery, &metrics, &readiness).await?;
+    // Wrap with active gRPC health-check probing if configured.
+    // Otherwise the inner pool is used directly (Phase-1 passive
+    // behaviour).
+    let pool = wrap_with_healthcheck(pool, &cfg.health_check);
     let store = build_affinity_store(&cfg.affinity_store).await?;
     let router = Arc::new(Router::new(pool, store));
     let dialer = Dialer::new();
@@ -72,13 +77,57 @@ async fn main() -> Result<()> {
     let addr = parse_bind_addr(&cfg.bind_addr)?;
     log_startup(&cfg, &addr);
 
-    // Coordinate shutdown across the two servers (gRPC + admin) using a
-    // watch channel.
+    // Two-phase shutdown:
+    //   1. SIGTERM arrives → flip /readyz to 503 (K8s drains us from
+    //      the Service), wait for active streams to finish or for the
+    //      drain deadline.
+    //   2. Trigger the gRPC + admin server shutdown.
+    //
+    // The two phases are coordinated by `drain_tx` (phase 1 → 2) and
+    // `shutdown_tx` (phase 2 → both servers).
+    let (drain_tx, mut drain_rx) = watch::channel(false);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let readiness_for_drain = readiness.clone();
+    let metrics_for_drain = metrics.clone();
+    let shutdown_deadline = std::time::Duration::from_secs(cfg.shutdown.deadline_secs);
     tokio::spawn(async move {
         shutdown_signal().await;
+        info!(
+            deadline_secs = shutdown_deadline.as_secs(),
+            "shutdown: SIGTERM/SIGINT received; entering drain"
+        );
+        // Phase 1: tell K8s we're not ready so new traffic stops flowing.
+        readiness_for_drain.mark_not_ready();
+        let _ = drain_tx.send(true);
+        // Wait for in-flight streams to drain or the deadline to expire.
+        let drain_result = tokio::time::timeout(shutdown_deadline, async {
+            loop {
+                let active = metrics_for_drain.active_streams_value();
+                if active <= 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        let final_active = metrics_for_drain.active_streams_value();
+        match drain_result {
+            Ok(()) => info!(
+                final_active_streams = final_active,
+                "shutdown: drain complete"
+            ),
+            Err(_) => warn!(
+                deadline_secs = shutdown_deadline.as_secs(),
+                final_active_streams = final_active,
+                "shutdown: drain deadline reached; forcing shutdown"
+            ),
+        }
+        // Phase 2: stop the servers.
         let _ = shutdown_tx.send(true);
     });
+    // The drain_rx is parked here to keep the channel alive; the drain
+    // task is the only producer.
+    let _ = drain_rx.borrow_and_update();
 
     let admin_handle = if let Some(admin_addr_str) = &cfg.admin_addr {
         let admin_addr = parse_bind_addr(admin_addr_str)?;
@@ -172,6 +221,26 @@ async fn build_pool(
             Ok((Arc::new(pool), Some(handle)))
         }
     }
+}
+
+/// Wrap `inner` with active health-check probing if enabled.
+/// Otherwise return the inner pool unchanged. The probe task is
+/// spawned and detached; we hold no JoinHandle because the task
+/// keeps a strong Arc to the wrapper, which is itself owned by the
+/// router for the lifetime of the process.
+fn wrap_with_healthcheck(inner: Arc<dyn Pool>, cfg: &HealthCheckSettings) -> Arc<dyn Pool> {
+    if !cfg.enabled {
+        return inner;
+    }
+    let hc_cfg = HealthCheckConfig {
+        interval: std::time::Duration::from_secs(cfg.interval_secs),
+        timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+        unhealthy_threshold: cfg.unhealthy_threshold,
+        healthy_threshold: cfg.healthy_threshold,
+    };
+    let wrapper = HealthAwarePool::new(inner, hc_cfg);
+    let _probe = wrapper.spawn_probe();
+    wrapper
 }
 
 /// Build the configured `AffinityStore`. Memory is in-process and

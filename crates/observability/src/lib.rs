@@ -16,7 +16,7 @@ pub mod metrics;
 pub mod tracing;
 
 pub use admin::{serve_admin, AdminConfig, ReadinessProbe};
-pub use metrics::{Metrics, MetricsError, RpcGuard};
+pub use metrics::{Metrics, MetricsError, RpcGuard, StreamGuard};
 #[cfg(feature = "testing")]
 pub use tracing::install_test_subscriber;
 pub use tracing::{

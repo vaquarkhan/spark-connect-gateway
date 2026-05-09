@@ -213,6 +213,72 @@ Production rule of thumb: `oidc` if you have an IdP, `jwt` if you're
 issuing JWTs in-house, `static` for a closed dev setup, `none` only
 for namespace-isolated clusters.
 
+## Active backend health checks
+
+By default the gateway routes to whatever its pool reports as
+healthy: a static-pool member is always assumed up; a K8s
+service-watch pool reflects the EndpointSlice. Neither catches a
+backend that is *running* but *wedged* — the pod responds to TCP
+but its gRPC server is stuck. Active probing closes that gap.
+
+Turn it on:
+
+```yaml
+healthCheck:
+  enabled: true
+  intervalSecs: 5            # probe every 5s
+  timeoutSecs: 2             # 2s deadline per probe
+  unhealthyThreshold: 3      # 3 consecutive failures → evict
+  healthyThreshold: 2        # 2 consecutive successes → re-admit
+```
+
+Each backend is probed via `grpc.health.v1.Health/Check` (the
+[standard protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)).
+A backend that doesn't ship the Health service responds with
+`UNIMPLEMENTED`/`NOT_FOUND`; the gateway treats that as an
+ambiguous signal and keeps the backend in rotation, since older
+Spark Connect server builds don't register Health by default.
+
+Defaults (5s × 3 = ~15s eviction window) are biased towards "don't
+evict on a momentary glitch" rather than "evict instantly." Tighten
+if your traffic is sensitive to a stuck-pod tail.
+
+## Graceful shutdown
+
+When the gateway pod gets SIGTERM (Helm rolling upgrade, K8s pod
+eviction, scale-down), it does a two-phase drain:
+
+1. **Phase 1 — readiness flips off.** `/readyz` starts returning
+   503; the K8s Service controller removes the pod from its
+   Endpoints within ~5s. New client traffic stops landing.
+2. **Phase 2 — wait for in-flight streams.** The gateway polls
+   `scg_active_streams`. As long as ExecutePlan / ReattachExecute
+   / AddArtifacts streams are still flowing, the gRPC server stays
+   up. When `active_streams == 0` *or* `shutdown.deadlineSecs`
+   elapses, the gRPC + admin servers shut down.
+
+Configure the deadline:
+
+```yaml
+shutdown:
+  deadlineSecs: 30
+```
+
+The chart's `terminationGracePeriodSeconds` is automatically set to
+`deadlineSecs + 10` so K8s gives the gateway enough wall-clock to
+finish draining before SIGKILL hits. **If you change one without the
+other**, the smaller value wins:
+
+* `deadlineSecs` smaller → drain force-quits early; in-flight
+  streams seen as `Cancelled` by clients.
+* `terminationGracePeriodSeconds` smaller → K8s SIGKILLs mid-drain;
+  same client-side effect, plus `shutdown complete` log line never
+  appears.
+
+For long-running ExecutePlan workloads, raise both. The chart's
+30s default is enough for the gRPC handshake teardown, but a
+multi-minute Spark query in flight will be cut.
+
 ## Day 1: hardening
 
 The defaults give you function; production needs all of:

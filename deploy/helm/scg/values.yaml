@@ -155,6 +155,26 @@ redis:
     accessModes:
       - ReadWriteOnce
 
+# Active gRPC health-check probing for backend pool members. When
+# enabled, the gateway calls `grpc.health.v1.Health/Check` on each
+# backend periodically and removes repeatedly-failing ones from the
+# routing pool. Off by default to avoid breaking deployments where
+# backends don't ship the standard Health service.
+healthCheck:
+  enabled: false
+  intervalSecs: 5
+  timeoutSecs: 2
+  unhealthyThreshold: 3
+  healthyThreshold: 2
+
+# Graceful shutdown: on SIGTERM the gateway flips `/readyz` to 503
+# (so K8s drains it from the Service), then waits for in-flight
+# streaming RPCs to complete up to `deadlineSecs` before forcing
+# termination. Match `terminationGracePeriodSeconds` in the pod
+# spec — a too-short K8s grace will SIGKILL before drain finishes.
+shutdown:
+  deadlineSecs: 30
+
 # Distributed tracing — exports OTLP/gRPC spans to a collector. Off
 # by default; structured JSON logs work regardless.
 tracing:

@@ -19,6 +19,8 @@ config knobs see [`deployment.md`](deployment.md).
 * [Redis is down](#redis-is-down)
 * [`PermissionError` on K8s endpoints](#permissionerror-on-k8s-endpoints)
 * [P99 latency suddenly doubled](#p99-latency-suddenly-doubled)
+* [Streams killed during rolling upgrade](#streams-killed-during-rolling-upgrade)
+* [Backend marked unhealthy but it's actually fine](#backend-marked-unhealthy-but-its-actually-fine)
 
 ---
 
@@ -319,3 +321,65 @@ If none of these explain it, capture a CPU profile from one slow
 gateway pod (`kubectl debug` + `perf` / `samply`); the gateway's
 hot paths are auth, request_id generation, and the tonic forward —
 unusual time anywhere else is a clue.
+
+---
+
+## Streams killed during rolling upgrade
+
+**Symptom:** During `helm upgrade`, clients with active
+ExecutePlan streams see `Status::Cancelled` mid-query, even though
+the upgrade should have been graceful. Gateway logs show
+`shutdown: drain deadline reached; forcing shutdown`.
+
+**Why:** A long-running stream took longer than
+`shutdown.deadlineSecs` (default 30) to finish, so the drain loop
+gave up and the gRPC server tore connections down.
+
+**Check:**
+```bash
+kubectl -n spark-connect logs -l app.kubernetes.io/name=scg --tail=200 | grep "drain"
+```
+
+The line tells you `final_active_streams=N` — that's how many
+streams were still flowing at the deadline.
+
+**Fix:**
+
+| Cause | Action |
+|---|---|
+| `shutdown.deadlineSecs` too small for your workload | Bump it. Typical value for Spark Connect with multi-minute queries: 300s. Remember the chart auto-sets `terminationGracePeriodSeconds` to `deadlineSecs + 10`, so K8s grace adjusts too. |
+| Long-running streams during a routine rollout | Schedule rollouts away from peak query time, or use `kubectl rollout pause`/`resume` to do them one pod at a time. |
+| Stream is genuinely stuck (backend not yielding) | Check the backend driver. Drain is doing the right thing — at some point you have to SIGKILL. |
+
+**Verify the fix locally** with the example: `cargo run -p scg-proxy
+--example drain_smoke`. It opens a 1.5s stream and triggers drain
+mid-flight; passing means a stream of that duration completes
+without being killed.
+
+---
+
+## Backend marked unhealthy but it's actually fine
+
+**Symptom:** With `healthCheck.enabled: true`, a backend you know
+is healthy stops getting traffic. `scg_backend_pool_size` dropped
+even though no K8s event happened.
+
+**Check:** gateway logs for the eviction:
+
+```bash
+kubectl -n spark-connect logs -l app.kubernetes.io/name=scg --tail=500 | grep "healthcheck.*UNHEALTHY"
+```
+
+**Common causes:**
+
+| Log signal | Cause | Fix |
+|---|---|---|
+| `healthcheck: connect failed` | Network blip / DNS hiccup; the backend is fine but the probe couldn't reach it from this gateway pod | Check NetworkPolicy / kube-dns. If transient, the backend will be re-admitted after `healthyThreshold` successful probes. |
+| `healthcheck: probe failed ... DeadlineExceeded` | Backend's gRPC server is loaded; Health is responding but slowly | Bump `healthCheck.timeoutSecs`. |
+| `healthcheck: probe failed ... Status: ...` (any other code) | Backend returned a real RPC error from Health.Check (not Unimplemented) | The backend really thinks it's unhealthy. Look at backend logs. |
+
+If the backend doesn't ship `grpc.health.v1.Health` at all (older
+Spark Connect releases), the gateway *should* treat
+`Unimplemented` / `NotFound` as ambiguous and keep it healthy.
+If you see persistent eviction with no clear failure reason in
+logs, that's a regression — file an issue.

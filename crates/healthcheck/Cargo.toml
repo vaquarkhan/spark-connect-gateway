@@ -1,0 +1,19 @@
+[package]
+name = "scg-healthcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-routing = { path = "../routing" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+tonic-health = { workspace = true }

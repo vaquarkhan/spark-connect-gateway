@@ -494,9 +494,14 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         req: Request<pb::ExecutePlanRequest>,
     ) -> Result<Response<Self::ExecutePlanStream>, Status> {
         let mut guard = self.metrics.rpc_guard("ExecutePlan");
-        let _stream_guard = self.metrics.stream_guard();
+        // The stream guard is moved into the forwarded stream below so it
+        // outlives the response — a streaming RPC's "lifetime" for
+        // scg_active_streams is the lifetime of the *stream*, not of
+        // this handler function.
+        let stream_guard = self.metrics.stream_guard();
         let rid = request_id();
         let span = rpc_span("ExecutePlan", &rid, req.metadata());
+        let metrics = self.metrics.clone();
         let result: Result<Response<Self::ExecutePlanStream>, Status> = async {
             let identity = self.authenticate(req.metadata()).await?;
             let mut body = req.into_inner();
@@ -518,10 +523,14 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
             let upstream = c.execute_plan(outbound).await?.into_inner();
-            Ok(Response::new(forward_server_stream(upstream)))
+            Ok(Response::new(forward_server_stream(upstream, stream_guard)))
         }
         .instrument(span)
         .await;
+        // If we never built a stream (early error), the guard would be
+        // dropped by the .await above; otherwise the stream owns it now.
+        // Either way active_streams accounting is correct.
+        let _ = metrics;
         finalise_guard(&mut guard, &result);
         result
     }
@@ -531,7 +540,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
         req: Request<pb::ReattachExecuteRequest>,
     ) -> Result<Response<Self::ReattachExecuteStream>, Status> {
         let mut guard = self.metrics.rpc_guard("ReattachExecute");
-        let _stream_guard = self.metrics.stream_guard();
+        let stream_guard = self.metrics.stream_guard();
         let rid = request_id();
         let span = rpc_span("ReattachExecute", &rid, req.metadata());
         let result: Result<Response<Self::ReattachExecuteStream>, Status> = async {
@@ -544,7 +553,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
             let upstream = c.reattach_execute(outbound).await?.into_inner();
-            Ok(Response::new(forward_server_stream(upstream)))
+            Ok(Response::new(forward_server_stream(upstream, stream_guard)))
         }
         .instrument(span)
         .await;
@@ -611,9 +620,19 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
 
 fn forward_server_stream<T: Send + 'static>(
     upstream: Streaming<T>,
+    // The stream guard must outlive the stream, not the handler
+    // function — otherwise scg_active_streams returns to 0 the
+    // moment we hand the Response back, even though the stream is
+    // still flowing. Capture it in the async_stream so it drops
+    // when the *stream* is dropped (i.e. when the client closes,
+    // the stream completes, or it errors).
+    stream_guard: scg_observability::StreamGuard,
 ) -> Pin<Box<dyn Stream<Item = StreamItem<T>> + Send + 'static>> {
-    Box::pin(upstream.map(|res| match res {
-        Ok(msg) => Ok(msg),
-        Err(status) => Err(status),
-    }))
+    Box::pin(async_stream::stream! {
+        let _guard = stream_guard;
+        let mut upstream = upstream;
+        while let Some(item) = upstream.next().await {
+            yield item;
+        }
+    })
 }

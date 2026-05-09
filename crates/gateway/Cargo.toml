@@ -20,6 +20,7 @@ scg-proxy = { path = "../proxy" }
 scg-routing = { path = "../routing" }
 scg-store-memory = { path = "../store-memory" }
 scg-store-redis = { path = "../store-redis" }
+scg-healthcheck = { path = "../healthcheck" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

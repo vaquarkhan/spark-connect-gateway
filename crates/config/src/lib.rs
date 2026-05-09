@@ -192,6 +192,81 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
+/// Active gRPC health-check probing for backend pool members. Wraps
+/// the configured pool with a probe loop that calls
+/// `grpc.health.v1.Health/Check` on each backend and removes
+/// repeatedly-failing ones from `pick()`. Off by default to avoid
+/// breaking deployments where backends don't ship the standard
+/// Health service.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthCheckSettings {
+    /// Master switch. `false` (default) keeps the Phase-1 passive
+    /// behaviour: routing fails through to the next session on a
+    /// forward error.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hc_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_hc_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_hc_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default = "default_hc_healthy_threshold")]
+    pub healthy_threshold: u32,
+}
+
+impl Default for HealthCheckSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_hc_interval_secs(),
+            timeout_secs: default_hc_timeout_secs(),
+            unhealthy_threshold: default_hc_unhealthy_threshold(),
+            healthy_threshold: default_hc_healthy_threshold(),
+        }
+    }
+}
+
+fn default_hc_interval_secs() -> u64 {
+    5
+}
+fn default_hc_timeout_secs() -> u64 {
+    2
+}
+fn default_hc_unhealthy_threshold() -> u32 {
+    3
+}
+fn default_hc_healthy_threshold() -> u32 {
+    2
+}
+
+/// Graceful shutdown behaviour. On SIGINT/SIGTERM, the gateway
+/// flips `/readyz` to 503 (so K8s drains it from the Service), then
+/// waits for in-flight streaming RPCs (`ExecutePlan`,
+/// `ReattachExecute`, `AddArtifacts`) to complete, up to
+/// `deadline_secs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShutdownSettings {
+    /// Hard ceiling on the drain period. After this many seconds the
+    /// gateway forcibly shuts down regardless of in-flight streams.
+    /// Pick something compatible with your K8s
+    /// `terminationGracePeriodSeconds` (the chart defaults to 30).
+    #[serde(default = "default_shutdown_deadline_secs")]
+    pub deadline_secs: u64,
+}
+
+impl Default for ShutdownSettings {
+    fn default() -> Self {
+        Self {
+            deadline_secs: default_shutdown_deadline_secs(),
+        }
+    }
+}
+
+fn default_shutdown_deadline_secs() -> u64 {
+    30
+}
+
 /// Distributed-tracing configuration. Off by default — Phase-1 configs
 /// without a `tracing:` section keep working.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -246,6 +321,10 @@ struct RawConfig {
     tracing: Option<TracingSettings>,
     #[serde(default)]
     affinity_store: Option<AffinityStoreConfig>,
+    #[serde(default)]
+    health_check: Option<HealthCheckSettings>,
+    #[serde(default)]
+    shutdown: Option<ShutdownSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -265,6 +344,10 @@ pub struct Config {
     /// Where to keep affinity state. Defaults to in-memory; use
     /// `redis` for multi-replica HA.
     pub affinity_store: AffinityStoreConfig,
+    /// Active gRPC health-check probing for backends. Off by default.
+    pub health_check: HealthCheckSettings,
+    /// Graceful shutdown / drain settings.
+    pub shutdown: ShutdownSettings,
 }
 
 fn default_bind_addr() -> String {
@@ -316,6 +399,8 @@ impl Config {
             admin_addr: raw.admin_addr.filter(|s| !s.is_empty()),
             tracing: raw.tracing,
             affinity_store: raw.affinity_store.unwrap_or_default(),
+            health_check: raw.health_check.unwrap_or_default(),
+            shutdown: raw.shutdown.unwrap_or_default(),
         })
     }
 }
@@ -614,6 +699,57 @@ affinity_store:
             }
             other => panic!("expected Redis, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn health_check_defaults_to_disabled() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(!c.health_check.enabled);
+        // Default values present even when block omitted:
+        assert_eq!(c.health_check.interval_secs, 5);
+        assert_eq!(c.health_check.unhealthy_threshold, 3);
+    }
+
+    #[test]
+    fn loads_health_check_block() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+health_check:
+  enabled: true
+  interval_secs: 10
+  timeout_secs: 3
+  unhealthy_threshold: 5
+  healthy_threshold: 3
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.health_check.enabled);
+        assert_eq!(c.health_check.interval_secs, 10);
+        assert_eq!(c.health_check.timeout_secs, 3);
+        assert_eq!(c.health_check.unhealthy_threshold, 5);
+        assert_eq!(c.health_check.healthy_threshold, 3);
+    }
+
+    #[test]
+    fn shutdown_defaults() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert_eq!(c.shutdown.deadline_secs, 30);
+    }
+
+    #[test]
+    fn loads_shutdown_block() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+shutdown:
+  deadline_secs: 90
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert_eq!(c.shutdown.deadline_secs, 90);
     }
 
     #[test]

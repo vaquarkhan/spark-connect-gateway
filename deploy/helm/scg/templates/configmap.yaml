@@ -129,6 +129,20 @@ data:
     {{- fail (printf "affinityStore.type must be memory|redis, got %q" .Values.affinityStore.type) }}
     {{- end }}
 
+    {{- /* ---- health-check ---- */}}
+    {{- if .Values.healthCheck.enabled }}
+    health_check:
+      enabled: true
+      interval_secs: {{ .Values.healthCheck.intervalSecs }}
+      timeout_secs: {{ .Values.healthCheck.timeoutSecs }}
+      unhealthy_threshold: {{ .Values.healthCheck.unhealthyThreshold }}
+      healthy_threshold: {{ .Values.healthCheck.healthyThreshold }}
+    {{- end }}
+
+    {{- /* ---- shutdown ---- */}}
+    shutdown:
+      deadline_secs: {{ .Values.shutdown.deadlineSecs }}
+
     {{- /* ---- tracing ---- */}}
     {{- if .Values.tracing.enabled }}
     tracing:

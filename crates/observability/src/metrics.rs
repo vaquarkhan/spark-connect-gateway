@@ -164,6 +164,12 @@ impl Metrics {
             metrics: self.clone(),
         }
     }
+
+    /// Read the live `scg_active_streams` count. Used by the
+    /// graceful-shutdown loop to decide whether the server can stop.
+    pub fn active_streams_value(&self) -> i64 {
+        self.inner.active_streams.get()
+    }
 }
 
 impl std::fmt::Debug for Metrics {

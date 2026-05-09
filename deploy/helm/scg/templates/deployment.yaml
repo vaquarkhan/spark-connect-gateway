@@ -25,6 +25,11 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # Drain deadline + small buffer for the gRPC server to actually
+      # close. If you raise `shutdown.deadlineSecs`, raise this too —
+      # K8s SIGKILLs the pod when this elapses regardless of drain
+      # progress.
+      terminationGracePeriodSeconds: {{ add .Values.shutdown.deadlineSecs 10 }}
       serviceAccountName: {{ include "scg.serviceAccountName" . }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
