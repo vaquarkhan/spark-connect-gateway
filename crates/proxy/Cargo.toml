@@ -37,4 +37,6 @@ reqwest = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
 opentelemetry-proto = { workspace = true }
+scg-healthcheck = { path = "../healthcheck" }
+hdrhistogram = { workspace = true }
 

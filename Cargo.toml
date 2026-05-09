@@ -78,6 +78,7 @@ bytes = "1"
 
 # Test-only
 tempfile = "3"
+hdrhistogram = { version = "7", default-features = false }
 testcontainers-modules = { version = "0.15", features = ["redis"] }
 
 [profile.release]

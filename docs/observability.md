@@ -239,6 +239,28 @@ What this means in practice:
 This is tracked as a known issue from Phase 2.13. The structured
 log line is the authoritative record for now.
 
+## What "normal" looks like
+
+The gateway is a forwarding proxy — its hot path is auth + routing
++ tonic forward, with no business logic of its own. Reasonable
+healthy numbers from a single replica on a modest pod
+(1 vCPU, 512Mi):
+
+| Metric | Healthy band | Notes |
+|---|---|---|
+| `scg_rpcs_total` rate | 1k–10k unary RPC/s sustained | Real Spark workloads rarely run this hot on unary |
+| `scg_rpc_duration_seconds` p99 (unary) | 1–5ms | Dominated by tonic HTTP/2 framing, not by gateway logic |
+| `scg_rpc_duration_seconds` p99 (`ExecutePlan`) | bounded by query length | This metric measures stream lifetime; long queries are expected |
+| `scg_active_streams` | proportional to concurrent users | Spikes are OK; sustained high values are a capacity-planning signal |
+| `scg_auth_failures_total` | near-zero baseline | Spikes correlate with IdP key rotation or client config changes |
+| `scg_backend_pool_size` | constant on static, varies on k8s | Drops to 0 ⇒ critical; see [runbook](runbook.md#readyz-stuck-on-503) |
+
+For exact numbers from a synthetic harness on a beefy
+workstation — useful for relative comparison ("am I 5x slower than
+the harness?") — see [`perf-baseline.md`](perf-baseline.md). Run
+`cargo run -p scg-proxy --example load --release -- ...` against
+your own deployment for an apples-to-apples number.
+
 ## Suggested alerts (starting points)
 
 Adjust thresholds to your traffic baseline.

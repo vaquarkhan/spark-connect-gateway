@@ -305,6 +305,10 @@ For day-2 operations, see:
   for the failures you'll actually hit (CrashLoopBackOff, `/readyz`
   503, broken stickiness, Redis outage, auth failure spikes, K8s
   RBAC, latency regressions).
+* [`docs/perf-baseline.md`](docs/perf-baseline.md) — performance
+  baseline numbers (unary throughput, streaming concurrency,
+  health-check overhead, drain semantics under load) reproducible
+  via the load harness in `crates/proxy/examples/load.rs`.
 
 ### Run on Kubernetes (auto-discovery)
 
