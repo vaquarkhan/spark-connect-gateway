@@ -9,6 +9,7 @@ members = [
     "crates/healthcheck",
     "crates/tenant",
     "crates/ratelimit",
+    "crates/audit",
     "crates/pool-static",
     "crates/pool-k8s",
     "crates/auth",

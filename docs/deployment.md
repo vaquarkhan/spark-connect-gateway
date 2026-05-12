@@ -340,6 +340,43 @@ whether the limits are biting and which scope (`tenant` vs `user`)
 is the bottleneck. See [`observability.md`](observability.md) for
 PromQL examples.
 
+## Audit logging (Phase 3.8)
+
+The gateway always knows *what* happened (metrics) and *how it
+happened* (logs/traces). Audit logging adds a third stream tuned for
+*who did what, when* — the events compliance and security teams ask
+for. Configure under `audit:` in `values.yaml`:
+
+```yaml
+audit:
+  enabled: true              # default
+  logSuccessfulRpcs: false   # default; turn on only under strict policy
+```
+
+Default events (`session.create`, `session.release`, `auth.failure`,
+`rpc.error`) are emitted as JSON log lines with
+`"target": "scg::audit"` — operators filter on that target in
+Loki/Splunk to materialise an audit stream distinct from operational
+logs. See [`observability.md`](observability.md#audit-logging) for the
+event schema, sample queries, and the rationale for reusing the log
+pipeline instead of adding a separate sink.
+
+When to flip `logSuccessfulRpcs: true`:
+
+* The deployment falls under a policy that requires per-call records
+  (regulated industries, SOC 2 type-II audits scoped to data access).
+* You have a log-retention budget that can absorb one extra event per
+  successful RPC — the audit stream then scales with request rate.
+
+When to leave it off (most deployments): metric counts on
+`scg_rpcs_total{code="OK"}` already provide aggregate success, and
+filling the audit stream with every Config call dilutes the signal
+the four default events are meant to provide.
+
+Disable the whole stream (`audit.enabled: false`) only in dev/local
+environments — the per-event cost is one structured log line and
+there is rarely a good reason to keep it off in production.
+
 ## Active backend health checks
 
 By default the gateway routes to whatever its pool reports as

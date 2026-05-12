@@ -874,6 +874,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "scg-audit",
  "scg-auth",
  "scg-config",
  "scg-genproto",
@@ -2566,6 +2567,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "scg-audit"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "scg-auth"
 version = "0.1.0"
 dependencies = [
@@ -2681,6 +2691,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "reqwest",
+ "scg-audit",
  "scg-auth",
  "scg-genproto",
  "scg-healthcheck",
@@ -2698,6 +2709,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

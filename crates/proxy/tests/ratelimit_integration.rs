@@ -163,6 +163,7 @@ async fn spawn_rig(
         metrics.clone(),
         resolver,
         limiter,
+        scg_audit::AuditLogger::disabled(),
     );
 
     let gw_lis = TcpListener::bind("127.0.0.1:0").await.unwrap();

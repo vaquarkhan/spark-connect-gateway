@@ -233,6 +233,19 @@ tenantResolver:
   onMissing: use_default
   defaultName: default
 
+# Audit logging — emits four security-relevant event types
+# (`session.create`, `session.release`, `auth.failure`, `rpc.error`)
+# through the JSON log pipeline with `target=scg::audit`. Filter on
+# that target in your log aggregator (Loki, Splunk, …) to get a
+# distinct audit stream.
+#
+# `logSuccessfulRpcs: true` additionally emits one `rpc.ok` event for
+# every successful RPC. Off by default — strict monitoring policies
+# only, since it multiplies the audit stream by ~the request rate.
+audit:
+  enabled: true
+  logSuccessfulRpcs: false
+
 # Active gRPC health-check probing for backend pool members. When
 # enabled, the gateway calls `grpc.health.v1.Health/Check` on each
 # backend periodically and removes repeatedly-failing ones from the

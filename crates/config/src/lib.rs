@@ -192,6 +192,39 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
+/// Audit logging configuration (Phase 3.8). Records security- and
+/// compliance-relevant events as structured `tracing` events with
+/// `target = "scg::audit"`. On by default — the per-event cost is
+/// negligible and the compliance value is high.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditSettings {
+    /// Master switch. `true` (default) writes session lifecycle,
+    /// auth failures, and RPC errors to the audit stream.
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    /// When `true`, every successful RPC also emits an `rpc.ok`
+    /// audit event. Off by default — successful RPCs are already
+    /// counted in `scg_rpcs_total{code="OK"}` and emitting one
+    /// audit event per successful RPC drowns out the events
+    /// operators actually care about. Switch on under strict
+    /// monitoring.
+    #[serde(default)]
+    pub log_successful_rpcs: bool,
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+
+impl Default for AuditSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            log_successful_rpcs: false,
+        }
+    }
+}
+
 /// Per-tenant rate-limit configuration (Phase 3.6). Token bucket
 /// per tenant with an optional per-user sub-bucket; both are
 /// disabled (`rpcs_per_second: 0`) by default so the limiter is a
@@ -479,6 +512,8 @@ struct RawConfig {
     tenant_pools: Option<TenantPoolsSettings>,
     #[serde(default)]
     rate_limit: Option<RateLimitSettings>,
+    #[serde(default)]
+    audit: Option<AuditSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -511,6 +546,8 @@ pub struct Config {
     pub tenant_pools: TenantPoolsSettings,
     /// Per-tenant rate limiting (Phase 3.6). Disabled by default.
     pub rate_limit: RateLimitSettings,
+    /// Structured audit logging (Phase 3.8). Enabled by default.
+    pub audit: AuditSettings,
 }
 
 fn default_bind_addr() -> String {
@@ -567,6 +604,7 @@ impl Config {
             tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
             tenant_pools: raw.tenant_pools.unwrap_or_default(),
             rate_limit: raw.rate_limit.unwrap_or_default(),
+            audit: raw.audit.unwrap_or_default(),
         })
     }
 }
@@ -1103,6 +1141,42 @@ rate_limit:
         assert_eq!(a.burst, 1000);
         assert_eq!(a.per_user_rpcs_per_second, 50.0);
         assert_eq!(a.per_user_burst, 100);
+    }
+
+    #[test]
+    fn audit_defaults_to_enabled_signals_only() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.audit.enabled);
+        assert!(!c.audit.log_successful_rpcs);
+    }
+
+    #[test]
+    fn loads_audit_block_with_successful_rpcs_on() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+audit:
+  enabled: true
+  log_successful_rpcs: true
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.audit.enabled);
+        assert!(c.audit.log_successful_rpcs);
+    }
+
+    #[test]
+    fn audit_can_be_disabled() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+audit:
+  enabled: false
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(!c.audit.enabled);
     }
 
     #[test]

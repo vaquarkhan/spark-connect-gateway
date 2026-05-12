@@ -206,6 +206,18 @@ impl TenantRouter {
     }
 }
 
+/// Outcome of a session-resolution call. `addr` is the backend
+/// for the session; `newly_bound` distinguishes a freshly-bound
+/// session (the gateway just decided which backend it lives on)
+/// from an existing one (the affinity store already had the
+/// binding). Used by audit logging to fire `session.create`
+/// exactly once per session lifetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveOutcome {
+    pub addr: String,
+    pub newly_bound: bool,
+}
+
 /// Resolves a request to a concrete backend address.
 pub struct Router {
     tenants: TenantRouter,
@@ -243,23 +255,50 @@ impl Router {
     /// fresh pick, but that binding is *not* recorded — without a
     /// stable session id we cannot honour stickiness on the next call.
     pub async fn resolve_session(&self, key: &SessionKey) -> Result<Option<String>, Status> {
+        Ok(self.resolve_session_detailed(key).await?.map(|r| r.addr))
+    }
+
+    /// Same as [`resolve_session`] but distinguishes a freshly-bound
+    /// session from an existing one — useful for audit logging
+    /// (Phase 3.8 emits `session.create` only on the freshly-bound
+    /// path). Most callers should use `resolve_session` and ignore
+    /// the binding flavour.
+    pub async fn resolve_session_detailed(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Option<ResolveOutcome>, Status> {
         let Some(pool) = self.tenants.pool_for(&key.tenant)? else {
-            // UseDefault with no default configured → behaves like an
-            // empty pool. Phase 2 callers already handle `None`.
             return Ok(None);
         };
         if key.is_zero() {
-            return Ok(pool.pick());
+            // Empty session_id is never bound — the affinity store
+            // ignores it. Counts as `newly_bound = false` for audit
+            // purposes (there's nothing to record).
+            return Ok(pool.pick().map(|addr| ResolveOutcome {
+                addr,
+                newly_bound: false,
+            }));
         }
         if let Some(existing) = self.store.lookup_session(key).await {
-            return Ok(Some(existing));
+            return Ok(Some(ResolveOutcome {
+                addr: existing,
+                newly_bound: false,
+            }));
         }
         let Some(chosen) = pool.pick() else {
             return Ok(None);
         };
-        Ok(Some(
-            self.store.bind_session_if_absent(key.clone(), chosen).await,
-        ))
+        let winner = self
+            .store
+            .bind_session_if_absent(key.clone(), chosen.clone())
+            .await;
+        Ok(Some(ResolveOutcome {
+            addr: winner.clone(),
+            // If our `bind` returned a different value than what we
+            // tried to insert, someone else won the race — we did
+            // not freshly bind this session.
+            newly_bound: winner == chosen,
+        }))
     }
 
     /// Resolve a backend for an operation, falling back to session

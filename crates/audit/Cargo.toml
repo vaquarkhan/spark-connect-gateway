@@ -1,0 +1,13 @@
+[package]
+name = "scg-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }

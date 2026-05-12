@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use scg_audit::{AuditConfig, AuditLogger};
 use scg_auth::{
     jwt::{JwtConfig, KeySource as AuthKeySource},
     oidc::OidcConfig,
@@ -12,10 +13,10 @@ use scg_auth::{
     AnonymousAuthenticator, AuthInterceptor, Authenticator, JwtAuthenticator, OidcAuthenticator,
 };
 use scg_config::{
-    AffinityStoreConfig, AuthConfig, BackendDiscovery, BucketSettings, Config, HealthCheckSettings,
-    JwtSettings, KeySource as CfgKeySource, OidcSettings, RateLimitSettings, RedisStoreSettings,
-    TenantOnMissing, TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry,
-    TracingSettings, UnknownTenantPolicySetting,
+    AffinityStoreConfig, AuditSettings, AuthConfig, BackendDiscovery, BucketSettings, Config,
+    HealthCheckSettings, JwtSettings, KeySource as CfgKeySource, OidcSettings, RateLimitSettings,
+    RedisStoreSettings, TenantOnMissing, TenantResolverSettings, TenantResolverSource,
+    TokenEntry as CfgTokenEntry, TracingSettings, UnknownTenantPolicySetting,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
     let auth = build_auth(&cfg.auth).await?;
     let tenant_resolver = build_tenant_resolver(&cfg.tenant_resolver);
     let rate_limiter = build_rate_limiter(&cfg.rate_limit, &metrics);
+    let audit = build_audit_logger(&cfg.audit);
     let svc = SparkConnectProxy::with_all(
         router,
         dialer,
@@ -78,6 +80,7 @@ async fn main() -> Result<()> {
         metrics.clone(),
         tenant_resolver,
         rate_limiter,
+        audit,
     );
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
@@ -383,6 +386,18 @@ fn build_rate_limiter(cfg: &RateLimitSettings, metrics: &Metrics) -> Option<Rate
     Some(RateLimiter::new(default, overrides, observer))
 }
 
+/// Translate the YAML `audit:` block into the runtime [`AuditLogger`].
+/// Defaults are conservative: enabled, but `rpc.ok` events stay off
+/// — operators flip `log_successful_rpcs: true` only under strict
+/// monitoring policies, since every successful RPC would otherwise
+/// hit the log pipeline.
+fn build_audit_logger(cfg: &AuditSettings) -> AuditLogger {
+    AuditLogger::new(AuditConfig {
+        enabled: cfg.enabled,
+        log_successful_rpcs: cfg.log_successful_rpcs,
+    })
+}
+
 /// Translate the YAML `tenant_resolver:` block into a runtime
 /// [`TenantResolver`]. The tagged `source` enum maps to the
 /// equivalent `scg-tenant` variant. With no `tenant_resolver:`
@@ -495,6 +510,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
         TenantOnMissing::Reject => "reject",
     };
     let rate_limit_enabled = cfg.rate_limit.enabled;
+    let audit_enabled = cfg.audit.enabled;
     match &cfg.discovery {
         BackendDiscovery::Static { addresses } => {
             info!(
@@ -506,6 +522,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 tenant_source,
                 tenant_on_missing,
                 rate_limit = rate_limit_enabled,
+                audit = audit_enabled,
                 backends = ?addresses,
                 "spark-connect-gateway starting"
             );
@@ -524,6 +541,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 tenant_source,
                 tenant_on_missing,
                 rate_limit = rate_limit_enabled,
+                audit = audit_enabled,
                 namespace = %namespace,
                 service = %service_name,
                 port,

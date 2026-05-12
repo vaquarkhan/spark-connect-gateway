@@ -223,6 +223,69 @@ Splunk:
 index=k8s namespace="spark-connect" | spath "fields.rid" | search "fields.rid"="ac54ca1b-*"
 ```
 
+## Audit logging
+
+The gateway emits a separate, narrow stream of structured events for
+security- and compliance-relevant transitions. Audit events share the
+same JSON log pipeline as operational logs but use a dedicated tracing
+`target` (`scg::audit`) so they can be split out in the aggregator.
+
+Five event types, controlled by `audit.enabled` (default `true`) and
+`audit.logSuccessfulRpcs` (default `false`):
+
+| `event`           | When                                                           | Default on? |
+|-------------------|----------------------------------------------------------------|-------------|
+| `session.create`  | A `(tenant, user, session_id)` is bound to a backend the first time | yes |
+| `session.release` | A client called `ReleaseSession` and the gateway forgot the binding | yes |
+| `auth.failure`    | Auth interceptor rejected the RPC (`reason` matches the metric label) | yes |
+| `rpc.error`       | A handler returned a non-OK Status (Cancelled is filtered out)  | yes |
+| `rpc.ok`          | Successful RPC — only when `logSuccessfulRpcs: true`            | no |
+
+Every audit event carries `rid` (correlation ID) plus the fields
+relevant to the event (`tenant`, `user_id`, `session_id`, `backend`,
+`rpc`, `code`, `message`, …). Successful RPCs are intentionally *not*
+logged by default because `scg_rpcs_total{code="OK"}` already counts
+them and filling the audit stream with every Config call defeats the
+purpose. Flip `logSuccessfulRpcs: true` only when the deployment is
+subject to a strict-monitoring policy that requires per-call audit.
+
+### Routing audit events to a dedicated stream
+
+Audit events are normal JSON log lines with `"target": "scg::audit"`,
+so any aggregator that can split on a structured field works.
+
+Loki / Grafana Logs:
+
+```logql
+# All audit events
+{namespace="spark-connect"} | json | target="scg::audit"
+
+# Just auth failures, grouped by reason
+{namespace="spark-connect"} | json | target="scg::audit" | event="auth.failure"
+
+# Session create/release pairs for a tenant
+{namespace="spark-connect"} | json | target="scg::audit" | tenant="team-a" |~ "session\\."
+```
+
+Splunk:
+
+```spl
+index=k8s namespace="spark-connect" "target"="scg::audit"
+| spath event | search event="rpc.error"
+| stats count by tenant, code
+```
+
+### Why not a separate audit sink?
+
+The audit pipeline reuses the JSON formatter rather than adding a
+file/Kafka/S3 sink trait. Trade-off: operators get one log pipeline
+to manage and existing log retention applies automatically, but the
+gateway never holds audit events in process memory or guarantees
+delivery beyond best-effort. If your compliance posture needs
+write-and-forget durability, intercept `target=scg::audit` events in
+a dedicated `tracing_subscriber::Layer` — the field schema is part
+of the API contract.
+
 ## Distributed tracing
 
 When `tracing.enabled: true`, every RPC opens a `scg_rpc` span on

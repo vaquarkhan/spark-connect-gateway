@@ -203,6 +203,11 @@ data:
       healthy_threshold: {{ .Values.healthCheck.healthyThreshold }}
     {{- end }}
 
+    {{- /* ---- audit logging ---- */}}
+    audit:
+      enabled: {{ .Values.audit.enabled }}
+      log_successful_rpcs: {{ .Values.audit.logSuccessfulRpcs }}
+
     {{- /* ---- shutdown ---- */}}
     shutdown:
       deadline_secs: {{ .Values.shutdown.deadlineSecs }}
