@@ -155,6 +155,38 @@ redis:
     accessModes:
       - ReadWriteOnce
 
+# Per-tenant rate limiting (Phase 3.6). Token-bucket per tenant
+# (and optionally per-user inside a tenant). Off by default — every
+# RPC is admitted. Turn on `enabled` and set `default.rpcsPerSecond`
+# + `default.burst` to apply a uniform limit; add entries under
+# `overrides` for tenants that need different limits.
+#
+# Per-user limits are independent of the tenant-level ones; both
+# buckets must have a token for the RPC to proceed. Leaving the
+# per-user fields at 0 disables that dimension.
+#
+# rateLimit:
+#   enabled: true
+#   default:
+#     rpcsPerSecond: 100
+#     burst: 200
+#     perUserRpcsPerSecond: 0
+#     perUserBurst: 0
+#   overrides:
+#     team-a:
+#       rpcsPerSecond: 500
+#       burst: 1000
+#       perUserRpcsPerSecond: 50
+#       perUserBurst: 100
+rateLimit:
+  enabled: false
+  default:
+    rpcsPerSecond: 0
+    burst: 0
+    perUserRpcsPerSecond: 0
+    perUserBurst: 0
+  overrides: {}
+
 # Per-tenant backend pool overrides (Phase 3.2). The `backendDiscovery`
 # above is the *default* pool — used for the `default` tenant and for
 # any tenant not explicitly listed below. Add an entry under

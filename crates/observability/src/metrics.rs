@@ -50,6 +50,9 @@ struct MetricsInner {
     // Pool / streams gauges.
     backend_pool_size: IntGauge,
     active_streams: IntGauge,
+
+    // Rate limit.
+    rate_limit_rejected_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -94,6 +97,12 @@ impl Metrics {
             "Currently in-flight server-streaming or client-streaming RPCs.",
             registry,
         )?;
+        let rate_limit_rejected_total = register_int_counter_vec_with_registry!(
+            "scg_rate_limit_rejected_total",
+            "RPCs rejected by per-tenant rate limiting, labelled by tenant and scope (tenant|user).",
+            &["tenant", "scope"],
+            registry,
+        )?;
         Ok(Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -102,8 +111,21 @@ impl Metrics {
                 auth_failures_total,
                 backend_pool_size,
                 active_streams,
+                rate_limit_rejected_total,
             }),
         })
+    }
+
+    /// Bump `scg_rate_limit_rejected_total{tenant, scope}`. `scope`
+    /// is the fixed-cardinality string `"tenant"` or `"user"`. The
+    /// label cardinality is bounded by the configured-tenant set —
+    /// callers should not pass user-input tenants that aren't in
+    /// the resolver's allowlist.
+    pub fn record_rate_limit_reject(&self, tenant: &str, scope: &str) {
+        self.inner
+            .rate_limit_rejected_total
+            .with_label_values(&[tenant, scope])
+            .inc();
     }
 
     /// Underlying `Registry` — handed to the admin HTTP server so the

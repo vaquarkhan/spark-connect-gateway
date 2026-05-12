@@ -294,6 +294,52 @@ tenant from the resolver — routes through the deployment's single
 pool. This is identical to Phase 1/2 behaviour. You opt into
 multi-tenant routing by listing tenants you want isolated.
 
+## Per-tenant rate limiting (Phase 3.6)
+
+When a single tenant can monopolize the shared backends — bursts
+of session creation, runaway PySpark notebooks, malicious
+clients — rate limiting protects the rest. The gateway implements
+a token bucket per tenant (and optionally per user inside the
+tenant); every RPC takes a token, RPCs that find an empty bucket
+fail with `RESOURCE_EXHAUSTED`.
+
+Off by default. Turn on with:
+
+```yaml
+rateLimit:
+  enabled: true
+  default:
+    rpcsPerSecond: 100   # default tenant refill rate
+    burst: 200           # max consecutive RPCs before throttling
+  overrides:
+    team-a:
+      rpcsPerSecond: 500
+      burst: 1000
+    enterprise-tenant:
+      rpcsPerSecond: 2000
+      burst: 5000
+      perUserRpcsPerSecond: 200   # tighter per-user cap inside the tenant
+      perUserBurst: 400
+```
+
+The per-user dimension is opt-in. Leave `perUserRpcsPerSecond: 0`
+(the default) to skip it; only the per-tenant bucket applies. Turn
+it on when one tenant has many users and you want to keep any
+single user from using the tenant's entire quota.
+
+Tuning starting points:
+
+| Workload shape | Default RPS | Burst |
+|---|---|---|
+| Many short Spark queries per session | 200 | 400 |
+| Long ExecutePlan streams, infrequent setup RPCs | 30 | 60 |
+| Mixed / unknown | 100 | 200 |
+
+Reading `scg_rate_limit_rejected_total{tenant, scope}` tells you
+whether the limits are biting and which scope (`tenant` vs `user`)
+is the bottleneck. See [`observability.md`](observability.md) for
+PromQL examples.
+
 ## Active backend health checks
 
 By default the gateway routes to whatever its pool reports as

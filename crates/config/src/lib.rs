@@ -192,6 +192,45 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
+/// Per-tenant rate-limit configuration (Phase 3.6). Token bucket
+/// per tenant with an optional per-user sub-bucket; both are
+/// disabled (`rpcs_per_second: 0`) by default so the limiter is a
+/// no-op until the operator opts in.
+///
+/// Tenants not listed in `overrides` use `default`; an inbound RPC
+/// is admitted only when *both* applicable buckets (tenant +
+/// per-user, if enabled) have tokens.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RateLimitSettings {
+    /// Master switch. When `false` (default), no rate limiting is
+    /// performed even if `default` / `overrides` are populated.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default: BucketSettings,
+    #[serde(default)]
+    pub overrides: std::collections::HashMap<String, BucketSettings>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct BucketSettings {
+    /// Per-tenant token-bucket refill rate (RPCs/second). `0`
+    /// disables the per-tenant bucket entirely.
+    #[serde(default)]
+    pub rpcs_per_second: f64,
+    /// Per-tenant token-bucket capacity (max consecutive RPCs
+    /// before the limiter kicks in).
+    #[serde(default)]
+    pub burst: u64,
+    /// Per-user token-bucket refill rate inside the tenant. `0`
+    /// (default) disables this dimension — only the per-tenant
+    /// bucket is consulted.
+    #[serde(default)]
+    pub per_user_rpcs_per_second: f64,
+    #[serde(default)]
+    pub per_user_burst: u64,
+}
+
 /// Per-tenant backend pool overrides (Phase 3). A multi-tenant
 /// deployment lists one entry per tenant that needs its own pool;
 /// any tenant *not* listed here routes through the deployment's
@@ -438,6 +477,8 @@ struct RawConfig {
     tenant_resolver: Option<TenantResolverSettings>,
     #[serde(default)]
     tenant_pools: Option<TenantPoolsSettings>,
+    #[serde(default)]
+    rate_limit: Option<RateLimitSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -468,6 +509,8 @@ pub struct Config {
     /// Empty `overrides` + `use_default` reproduces Phase 1/2
     /// single-pool behaviour.
     pub tenant_pools: TenantPoolsSettings,
+    /// Per-tenant rate limiting (Phase 3.6). Disabled by default.
+    pub rate_limit: RateLimitSettings,
 }
 
 fn default_bind_addr() -> String {
@@ -523,6 +566,7 @@ impl Config {
             shutdown: raw.shutdown.unwrap_or_default(),
             tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
             tenant_pools: raw.tenant_pools.unwrap_or_default(),
+            rate_limit: raw.rate_limit.unwrap_or_default(),
         })
     }
 }
@@ -1021,6 +1065,44 @@ tenant_pools:
             }
             other => panic!("expected K8s, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn rate_limit_defaults_to_disabled() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(!c.rate_limit.enabled);
+        assert_eq!(c.rate_limit.default.rpcs_per_second, 0.0);
+        assert!(c.rate_limit.overrides.is_empty());
+    }
+
+    #[test]
+    fn loads_rate_limit_with_overrides() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+rate_limit:
+  enabled: true
+  default:
+    rpcs_per_second: 100
+    burst: 200
+  overrides:
+    team-a:
+      rpcs_per_second: 500
+      burst: 1000
+      per_user_rpcs_per_second: 50
+      per_user_burst: 100
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.rate_limit.enabled);
+        assert_eq!(c.rate_limit.default.rpcs_per_second, 100.0);
+        assert_eq!(c.rate_limit.default.burst, 200);
+        let a = c.rate_limit.overrides.get("team-a").unwrap();
+        assert_eq!(a.rpcs_per_second, 500.0);
+        assert_eq!(a.burst, 1000);
+        assert_eq!(a.per_user_rpcs_per_second, 50.0);
+        assert_eq!(a.per_user_burst, 100);
     }
 
     #[test]

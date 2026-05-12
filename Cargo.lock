@@ -882,6 +882,7 @@ dependencies = [
  "scg-pool-k8s",
  "scg-pool-static",
  "scg-proxy",
+ "scg-ratelimit",
  "scg-routing",
  "scg-store-memory",
  "scg-store-redis",
@@ -2685,6 +2686,7 @@ dependencies = [
  "scg-healthcheck",
  "scg-observability",
  "scg-pool-static",
+ "scg-ratelimit",
  "scg-routing",
  "scg-store-memory",
  "scg-store-redis",
@@ -2696,6 +2698,17 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-opentelemetry",
+]
+
+[[package]]
+name = "scg-ratelimit"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

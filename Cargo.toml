@@ -8,6 +8,7 @@ members = [
     "crates/store-redis",
     "crates/healthcheck",
     "crates/tenant",
+    "crates/ratelimit",
     "crates/pool-static",
     "crates/pool-k8s",
     "crates/auth",

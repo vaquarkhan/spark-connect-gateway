@@ -22,6 +22,7 @@ scg-store-memory = { path = "../store-memory" }
 scg-store-redis = { path = "../store-redis" }
 scg-healthcheck = { path = "../healthcheck" }
 scg-tenant = { path = "../tenant" }
+scg-ratelimit = { path = "../ratelimit" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }

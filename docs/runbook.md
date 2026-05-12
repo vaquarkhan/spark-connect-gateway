@@ -21,6 +21,7 @@ config knobs see [`deployment.md`](deployment.md).
 * [P99 latency suddenly doubled](#p99-latency-suddenly-doubled)
 * [Clients suddenly getting Unauthenticated after a config change](#clients-suddenly-getting-unauthenticated-after-a-config-change)
 * [Tenant getting PermissionDenied with "no configured pool"](#tenant-getting-permissiondenied-with-no-configured-pool)
+* [Clients seeing ResourceExhausted unexpectedly](#clients-seeing-resourceexhausted-unexpectedly)
 * [Streams killed during rolling upgrade](#streams-killed-during-rolling-upgrade)
 * [Backend marked unhealthy but it's actually fine](#backend-marked-unhealthy-but-its-actually-fine)
 
@@ -401,6 +402,45 @@ expect a brief uptick in `scg_rpcs_total{code="PermissionDenied"}`
 from any tenant you forgot to list. The deployment-time guard
 in the chart can't help here because the chart doesn't know which
 tenants your IdP will produce.
+
+## Clients seeing ResourceExhausted unexpectedly
+
+**Symptom:** Clients report
+`Status::ResourceExhausted` with messages like `tenant "X" rate
+limit exceeded` or `user "Y" rate limit exceeded (tenant "X")`.
+
+**Why:** Per-tenant rate limiting (Phase 3.6) is enabled and the
+client's RPC rate is above the configured bucket. Either:
+
+* The limit is reasonable but the client is genuinely runaway.
+* The limit is too tight for normal workload.
+* The deployment was upgraded with `rateLimit.enabled: true`
+  without sizing the buckets for actual traffic.
+
+**Check:** which scope is biting and how often?
+
+```bash
+# Reject rate per (tenant, scope) over the last 5 minutes
+kubectl -n spark-connect port-forward svc/scg 9090:9090 &
+curl -s http://localhost:9090/metrics | grep scg_rate_limit_rejected_total
+```
+
+Or via PromQL:
+```promql
+sum by (tenant, scope) (rate(scg_rate_limit_rejected_total[5m]))
+```
+
+**Fix:**
+
+| Scope | Action |
+|---|---|
+| `scope=tenant` sustained > 0 | Either the whole tenant is running hot → bump `rateLimit.overrides.<tenant>.rpcsPerSecond` + `.burst`, or it's a runaway client → find it via gateway logs filtered by tenant. |
+| `scope=user` sustained > 0 | One user inside the tenant is using the tenant's whole quota → either raise `perUserRpcsPerSecond` or talk to the user. |
+| Brief spike during deploy/burst | Expected. Bump `burst` (not `rpcsPerSecond`) if you want short bursts tolerated. |
+
+`helm upgrade` with the new `rateLimit` values rolls the pods.
+Existing buckets in the dropped pods are gone; new pods start
+with full burst.
 
 ## Streams killed during rolling upgrade
 

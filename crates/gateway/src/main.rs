@@ -12,10 +12,10 @@ use scg_auth::{
     AnonymousAuthenticator, AuthInterceptor, Authenticator, JwtAuthenticator, OidcAuthenticator,
 };
 use scg_config::{
-    AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, HealthCheckSettings, JwtSettings,
-    KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TenantOnMissing,
-    TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry, TracingSettings,
-    UnknownTenantPolicySetting,
+    AffinityStoreConfig, AuthConfig, BackendDiscovery, BucketSettings, Config, HealthCheckSettings,
+    JwtSettings, KeySource as CfgKeySource, OidcSettings, RateLimitSettings, RedisStoreSettings,
+    TenantOnMissing, TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry,
+    TracingSettings, UnknownTenantPolicySetting,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
@@ -25,6 +25,7 @@ use scg_observability::{
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
+use scg_ratelimit::{BucketRate, LimiterObserver, RateLimiter, RejectScope, TenantLimits};
 use scg_routing::{AffinityStore, Pool, Router, UnknownTenantPolicy};
 use scg_store_memory::MemoryStore;
 use scg_store_redis::{RedisStore, RedisStoreConfig};
@@ -69,12 +70,14 @@ async fn main() -> Result<()> {
 
     let auth = build_auth(&cfg.auth).await?;
     let tenant_resolver = build_tenant_resolver(&cfg.tenant_resolver);
-    let svc = SparkConnectProxy::with_components(
+    let rate_limiter = build_rate_limiter(&cfg.rate_limit, &metrics);
+    let svc = SparkConnectProxy::with_all(
         router,
         dialer,
         AuthInterceptor::new(auth),
         metrics.clone(),
         tenant_resolver,
+        rate_limiter,
     );
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
@@ -331,6 +334,55 @@ fn redis_store_config(s: &RedisStoreSettings) -> RedisStoreConfig {
     }
 }
 
+/// Adapter that turns a [`Metrics`] handle into a
+/// [`LimiterObserver`]: every rate-limit rejection bumps
+/// `scg_rate_limit_rejected_total{tenant, scope}`. Lives in the
+/// gateway crate (not in `scg-ratelimit`) so the ratelimit crate
+/// stays free of an observability dependency.
+struct MetricsLimiterObserver {
+    metrics: Metrics,
+}
+
+impl LimiterObserver for MetricsLimiterObserver {
+    fn on_reject(&self, tenant: &str, scope: RejectScope) {
+        self.metrics
+            .record_rate_limit_reject(tenant, scope.as_str());
+    }
+}
+
+fn bucket_rate(rps: f64, burst: u64) -> BucketRate {
+    BucketRate {
+        rpcs_per_second: rps,
+        burst,
+    }
+}
+
+fn tenant_limits_from(cfg: &BucketSettings) -> TenantLimits {
+    TenantLimits {
+        tenant: bucket_rate(cfg.rpcs_per_second, cfg.burst),
+        per_user: bucket_rate(cfg.per_user_rpcs_per_second, cfg.per_user_burst),
+    }
+}
+
+/// Build the configured [`RateLimiter`]. Returns `None` when
+/// `rate_limit.enabled: false` (the default) so the proxy hot
+/// path can skip the check entirely.
+fn build_rate_limiter(cfg: &RateLimitSettings, metrics: &Metrics) -> Option<RateLimiter> {
+    if !cfg.enabled {
+        return None;
+    }
+    let default = tenant_limits_from(&cfg.default);
+    let overrides: std::collections::HashMap<String, TenantLimits> = cfg
+        .overrides
+        .iter()
+        .map(|(k, v)| (k.clone(), tenant_limits_from(v)))
+        .collect();
+    let observer = Arc::new(MetricsLimiterObserver {
+        metrics: metrics.clone(),
+    });
+    Some(RateLimiter::new(default, overrides, observer))
+}
+
 /// Translate the YAML `tenant_resolver:` block into a runtime
 /// [`TenantResolver`]. The tagged `source` enum maps to the
 /// equivalent `scg-tenant` variant. With no `tenant_resolver:`
@@ -442,6 +494,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
         TenantOnMissing::UseDefault => "use_default",
         TenantOnMissing::Reject => "reject",
     };
+    let rate_limit_enabled = cfg.rate_limit.enabled;
     match &cfg.discovery {
         BackendDiscovery::Static { addresses } => {
             info!(
@@ -452,6 +505,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 affinity_store = store_kind,
                 tenant_source,
                 tenant_on_missing,
+                rate_limit = rate_limit_enabled,
                 backends = ?addresses,
                 "spark-connect-gateway starting"
             );
@@ -469,6 +523,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 affinity_store = store_kind,
                 tenant_source,
                 tenant_on_missing,
+                rate_limit = rate_limit_enabled,
                 namespace = %namespace,
                 service = %service_name,
                 port,

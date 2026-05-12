@@ -20,6 +20,21 @@ backends:
 #   service_name: spark-connect
 #   port: 15002
 
+# Per-tenant rate limiting (Phase 3.6). Token bucket per tenant with
+# an optional per-user dimension. Off by default — turn `enabled: true`
+# and size the buckets for your workload. See docs/deployment.md for
+# tuning starting points.
+#
+# rate_limit:
+#   enabled: true
+#   default:
+#     rpcs_per_second: 100
+#     burst: 200
+#   overrides:
+#     team-a:
+#       rpcs_per_second: 500
+#       burst: 1000
+
 # Per-tenant backend pool overrides. The `backends:` / `backend_discovery:`
 # above is the *default* pool; per-tenant entries here override it.
 #

@@ -11,6 +11,7 @@ use scg_genproto::pb;
 use scg_observability::{
     extract_parent, inject_context, request_id, Metrics, RpcGuard, REQUEST_ID_HEADER,
 };
+use scg_ratelimit::RateLimiter;
 use scg_routing::{Router, SessionKey};
 use scg_tenant::TenantResolver;
 use tokio_stream::wrappers::ReceiverStream;
@@ -48,6 +49,10 @@ pub struct SparkConnectProxy {
     /// is `(tenant, user_id, session_id)`; without a resolver every
     /// session ends up in `tenant="default"`.
     tenant_resolver: TenantResolver,
+    /// Per-tenant rate limiter. `None` skips the limiter check
+    /// entirely; a disabled limiter (`Some` with no buckets
+    /// enabled) is also free via [`RateLimiter::is_active`].
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl SparkConnectProxy {
@@ -77,9 +82,10 @@ impl SparkConnectProxy {
     }
 
     /// Convenience constructor: auth + metrics, default tenant
-    /// resolver. Equivalent to calling
+    /// resolver, no rate limiter. Equivalent to calling
     /// [`SparkConnectProxy::with_components`] with
-    /// `TenantResolver::new(TenantResolverConfig::default())`.
+    /// `TenantResolver::new(TenantResolverConfig::default())` and
+    /// `rate_limiter = None`.
     pub fn with_auth_and_metrics(
         router: Arc<Router>,
         dialer: Arc<Dialer>,
@@ -95,9 +101,8 @@ impl SparkConnectProxy {
         )
     }
 
-    /// Production constructor: hand in every component explicitly,
-    /// including the tenant resolver. Used by `crates/gateway/main`
-    /// once the operator's config is loaded.
+    /// Production constructor with tenant resolver but no rate
+    /// limiter. Most existing tests and examples use this.
     pub fn with_components(
         router: Arc<Router>,
         dialer: Arc<Dialer>,
@@ -105,12 +110,27 @@ impl SparkConnectProxy {
         metrics: Metrics,
         tenant_resolver: TenantResolver,
     ) -> Self {
+        Self::with_all(router, dialer, auth, metrics, tenant_resolver, None)
+    }
+
+    /// Full constructor: every component including the optional
+    /// rate limiter. Used by `crates/gateway/main` once the
+    /// operator's config is loaded.
+    pub fn with_all(
+        router: Arc<Router>,
+        dialer: Arc<Dialer>,
+        auth: AuthInterceptor,
+        metrics: Metrics,
+        tenant_resolver: TenantResolver,
+        rate_limiter: Option<RateLimiter>,
+    ) -> Self {
         Self {
             router,
             dialer,
             auth,
             metrics,
             tenant_resolver,
+            rate_limiter,
         }
     }
 
@@ -150,12 +170,20 @@ impl SparkConnectProxy {
     /// by every RPC handler — the tenant becomes the first segment
     /// of the routing key. A tenant-resolver `Reject` policy on a
     /// missing tenant surfaces as `Status::unauthenticated`.
+    ///
+    /// When a rate limiter is configured, this also takes a token
+    /// from the (tenant, user) bucket pair. Quota violations bubble
+    /// up as `Status::resource_exhausted` to the client and bump
+    /// `scg_rate_limit_rejected_total{tenant, scope}`.
     async fn authenticate_and_resolve(
         &self,
         metadata: &MetadataMap,
     ) -> Result<(Arc<Identity>, String), Status> {
         let identity = self.authenticate(metadata).await?;
         let tenant = self.tenant_resolver.resolve(metadata, &identity)?;
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.check(&tenant, &identity.user_id)?;
+        }
         Ok((identity, tenant))
     }
 }

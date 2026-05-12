@@ -11,6 +11,7 @@ scg-genproto = { path = "../genproto" }
 scg-observability = { path = "../observability" }
 scg-routing = { path = "../routing" }
 scg-tenant = { path = "../tenant" }
+scg-ratelimit = { path = "../ratelimit" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -31,6 +32,7 @@ scg-store-redis = { path = "../store-redis" }
 scg-pool-static = { path = "../pool-static" }
 scg-auth = { path = "../auth" }
 scg-tenant = { path = "../tenant" }
+scg-ratelimit = { path = "../ratelimit" }
 scg-observability = { path = "../observability", features = ["testing"] }
 tokio = { workspace = true }
 async-stream = "0.3"

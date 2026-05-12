@@ -97,6 +97,30 @@ JWKS arrived at the IdP, the gateway's cache hasn't refreshed
 because the floor-rate-limit is in effect. The OIDC authenticator
 self-heals — it'll refresh on the next call after the floor expires.
 
+### `scg_rate_limit_rejected_total{tenant, scope}` — counter
+
+RPCs rejected by the per-tenant rate limiter (Phase 3.6). `scope`
+is `"tenant"` or `"user"` depending on which bucket emptied first.
+`tenant` cardinality is bounded by the configured tenant set —
+`overrides` keys plus the literal `default` for fall-through
+tenants.
+
+```promql
+# Per-tenant reject rate
+sum by (tenant) (rate(scg_rate_limit_rejected_total[5m]))
+
+# Which scope is biting — tenant-wide vs. one user inside a tenant?
+sum by (scope) (rate(scg_rate_limit_rejected_total{tenant="team-a"}[5m]))
+
+# Tenants close to their limit (sustained reject rate)
+sum by (tenant) (rate(scg_rate_limit_rejected_total[15m])) > 0
+```
+
+A sustained non-zero rate on a specific `(tenant, scope)` pair
+means the configured limit is too tight (or that a single client
+is running away). Bump `rateLimit.overrides.<tenant>` in
+`values.yaml` and `helm upgrade`.
+
 ### `scg_backend_pool_size` — gauge
 
 Current count of healthy backends the gateway will route to. Set
