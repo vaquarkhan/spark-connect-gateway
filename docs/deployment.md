@@ -215,6 +215,11 @@ for namespace-isolated clusters.
 
 ## Multi-tenant: picking a tenant resolver (Phase 3)
 
+> **Looking for a one-page multi-tenant setup walkthrough?** See
+> [`multitenancy.md`](multitenancy.md) for the decision matrix,
+> three complete sample configs, and migration paths. The sections
+> below are the deep reference for each individual knob.
+
 The routing key the gateway uses for session affinity is now
 `(tenant, user_id, session_id)`. The tenant prefix lets two
 tenants share a gateway without their `session_id` namespaces

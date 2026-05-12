@@ -298,6 +298,9 @@ For day-2 operations, see:
 
 * [`docs/deployment.md`](docs/deployment.md) — from-zero deployment
   runbook: prerequisites, install, hardening, upgrades, uninstall.
+* [`docs/multitenancy.md`](docs/multitenancy.md) — multi-tenant
+  setup guide: decision matrix, three sample configs (permissive,
+  strict, single-tenant on Phase 3), migration paths.
 * [`docs/observability.md`](docs/observability.md) — every `scg_*`
   metric explained, PromQL examples, log line anatomy, distributed
   tracing guide, suggested alerts.
