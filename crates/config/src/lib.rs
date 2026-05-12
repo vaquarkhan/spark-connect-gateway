@@ -192,6 +192,46 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
+/// Per-tenant backend pool overrides (Phase 3). A multi-tenant
+/// deployment lists one entry per tenant that needs its own pool;
+/// any tenant *not* listed here routes through the deployment's
+/// default pool (the existing `backends:` / `backend_discovery:`
+/// settings).
+///
+/// The fallback `policy` decides what happens when an inbound RPC
+/// carries a tenant that has neither an explicit override nor (in
+/// the `Reject` case) any pool at all. Default `UseDefault` matches
+/// Phase 1/2 single-tenant deployments — everything routes to the
+/// default pool. `Reject` is the right choice for SaaS-style
+/// deployments where unconfigured tenants must not get any access.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TenantPoolsSettings {
+    /// Tenant name → its own pool's discovery configuration. The
+    /// `default` tenant is **not** special here; if you want the
+    /// default pool to be different from what `backends:` /
+    /// `backend_discovery:` provides, list it as an override too.
+    #[serde(default)]
+    pub overrides: std::collections::HashMap<String, BackendDiscovery>,
+    /// What to do when an inbound RPC has a tenant that's not in
+    /// `overrides`. `use_default` (default) routes through the
+    /// deployment's default pool; `reject` returns
+    /// `PermissionDenied` to the client.
+    #[serde(default = "default_unknown_tenant_policy")]
+    pub on_unknown_tenant: UnknownTenantPolicySetting,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownTenantPolicySetting {
+    #[default]
+    UseDefault,
+    Reject,
+}
+
+fn default_unknown_tenant_policy() -> UnknownTenantPolicySetting {
+    UnknownTenantPolicySetting::UseDefault
+}
+
 /// How the gateway figures out which tenant an inbound RPC belongs
 /// to. The resolved tenant becomes the first segment of the routing
 /// key, so two tenants with the same `session_id` get isolated
@@ -396,6 +436,8 @@ struct RawConfig {
     shutdown: Option<ShutdownSettings>,
     #[serde(default)]
     tenant_resolver: Option<TenantResolverSettings>,
+    #[serde(default)]
+    tenant_pools: Option<TenantPoolsSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -422,6 +464,10 @@ pub struct Config {
     /// How to figure out the tenant for each inbound RPC. Defaults
     /// to the back-compat behaviour (every RPC -> tenant="default").
     pub tenant_resolver: TenantResolverSettings,
+    /// Per-tenant backend pool overrides + unknown-tenant policy.
+    /// Empty `overrides` + `use_default` reproduces Phase 1/2
+    /// single-pool behaviour.
+    pub tenant_pools: TenantPoolsSettings,
 }
 
 fn default_bind_addr() -> String {
@@ -476,6 +522,7 @@ impl Config {
             health_check: raw.health_check.unwrap_or_default(),
             shutdown: raw.shutdown.unwrap_or_default(),
             tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
+            tenant_pools: raw.tenant_pools.unwrap_or_default(),
         })
     }
 }
@@ -916,6 +963,64 @@ tenant_resolver:
             TenantResolverSource::AlwaysDefault
         ));
         assert_eq!(c.tenant_resolver.default_name, "single-tenant");
+    }
+
+    #[test]
+    fn tenant_pools_default_empty_use_default() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.tenant_pools.overrides.is_empty());
+        assert!(matches!(
+            c.tenant_pools.on_unknown_tenant,
+            UnknownTenantPolicySetting::UseDefault
+        ));
+    }
+
+    #[test]
+    fn loads_tenant_pools_with_overrides() {
+        let f = write(
+            r#"
+backends: ["default-a:1", "default-b:1"]
+tenant_pools:
+  on_unknown_tenant: reject
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a-1:15002", "a-2:15002"]
+    team-b:
+      type: k8s
+      namespace: spark-b
+      service_name: spark-connect
+      port: 15002
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert_eq!(c.tenant_pools.overrides.len(), 2);
+        assert!(matches!(
+            c.tenant_pools.on_unknown_tenant,
+            UnknownTenantPolicySetting::Reject
+        ));
+        match c.tenant_pools.overrides.get("team-a").unwrap() {
+            BackendDiscovery::Static { addresses } => {
+                assert_eq!(
+                    addresses,
+                    &vec!["a-1:15002".to_string(), "a-2:15002".to_string()]
+                )
+            }
+            other => panic!("expected Static, got {:?}", other),
+        }
+        match c.tenant_pools.overrides.get("team-b").unwrap() {
+            BackendDiscovery::K8s {
+                namespace,
+                service_name,
+                port,
+            } => {
+                assert_eq!(namespace, "spark-b");
+                assert_eq!(service_name, "spark-connect");
+                assert_eq!(*port, 15002);
+            }
+            other => panic!("expected K8s, got {:?}", other),
+        }
     }
 
     #[test]

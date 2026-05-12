@@ -20,6 +20,21 @@ backends:
 #   service_name: spark-connect
 #   port: 15002
 
+# Per-tenant backend pool overrides. The `backends:` / `backend_discovery:`
+# above is the *default* pool; per-tenant entries here override it.
+#
+# tenant_pools:
+#   on_unknown_tenant: use_default  # or `reject` for strict isolation
+#   overrides:
+#     team-a:
+#       type: static
+#       addresses: ["spark-team-a-1:15002", "spark-team-a-2:15002"]
+#     team-b:
+#       type: k8s
+#       namespace: spark-team-b
+#       service_name: spark-connect
+#       port: 15002
+
 # How the gateway figures out which tenant each inbound RPC belongs
 # to. Default = tenant comes from auth claim, falls back to "default"
 # when missing — preserves Phase 1/2 single-tenant behaviour.

@@ -2705,6 +2705,7 @@ dependencies = [
  "async-trait",
  "parking_lot",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

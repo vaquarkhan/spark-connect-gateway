@@ -155,6 +155,33 @@ redis:
     accessModes:
       - ReadWriteOnce
 
+# Per-tenant backend pool overrides (Phase 3.2). The `backendDiscovery`
+# above is the *default* pool — used for the `default` tenant and for
+# any tenant not explicitly listed below. Add an entry under
+# `tenantPools.overrides` to give a specific tenant its own pool with
+# its own discovery shape (static list, K8s Endpoints, etc.).
+#
+# `onUnknownTenant` decides what happens when an inbound RPC carries
+# a tenant that has neither an entry here nor (under reject) any
+# fallback pool:
+#   use_default — route through the default pool (back-compat)
+#   reject       — return PermissionDenied to the client
+#
+# tenantPools:
+#   onUnknownTenant: use_default
+#   overrides:
+#     team-a:
+#       type: static
+#       addresses: ["spark-a-1:15002", "spark-a-2:15002"]
+#     team-b:
+#       type: k8s
+#       namespace: spark-team-b
+#       serviceName: spark-connect
+#       port: 15002
+tenantPools:
+  onUnknownTenant: use_default
+  overrides: {}
+
 # How the gateway figures out which tenant each inbound RPC belongs
 # to. The resolved tenant becomes the first segment of the routing
 # key, so two tenants with the same session_id stay isolated.

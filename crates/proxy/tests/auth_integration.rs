@@ -148,7 +148,7 @@ async fn rig() -> TestRig {
     // Gateway with static-token auth
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_addr]).unwrap());
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
 
     let auth = StaticTokenAuthenticator::new(vec![TokenEntry {

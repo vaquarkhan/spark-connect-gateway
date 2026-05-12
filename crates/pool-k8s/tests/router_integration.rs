@@ -45,14 +45,14 @@ impl AffinityStore for StubStore {
 #[tokio::test]
 async fn empty_pool_propagates_none_through_router() {
     let pool = Arc::new(K8sPool::new());
-    let router = Router::new(pool.clone(), Arc::new(StubStore::default()));
+    let router = Router::single_pool(pool.clone(), Arc::new(StubStore::default()));
     let key = SessionKey::new("u", "s");
     assert!(
-        router.resolve_session(&key).await.is_none(),
+        router.resolve_session(&key).await.unwrap().is_none(),
         "router should return None when pool is empty"
     );
     assert!(
-        router.resolve_op("op-1", &key).await.is_none(),
+        router.resolve_op("op-1", &key).await.unwrap().is_none(),
         "router should return None for op resolution too"
     );
 }
@@ -60,18 +60,18 @@ async fn empty_pool_propagates_none_through_router() {
 #[tokio::test]
 async fn stickiness_holds_across_membership_changes() {
     let pool = Arc::new(K8sPool::new());
-    let router = Router::new(pool.clone(), Arc::new(StubStore::default()));
+    let router = Router::single_pool(pool.clone(), Arc::new(StubStore::default()));
 
     pool.set_backends(vec!["a:1".into(), "b:1".into()]);
     let key = SessionKey::new("u", "s");
-    let first = router.resolve_session(&key).await.unwrap();
+    let first = router.resolve_session(&key).await.unwrap().unwrap();
 
     // Even if the K8s watcher emits a totally different membership,
     // the existing session must keep its binding.
     pool.set_backends(vec!["x:1".into(), "y:1".into(), "z:1".into()]);
     for _ in 0..5 {
         assert_eq!(
-            router.resolve_session(&key).await.unwrap(),
+            router.resolve_session(&key).await.unwrap().unwrap(),
             first,
             "stickiness must outlive pool membership churn"
         );
@@ -81,15 +81,15 @@ async fn stickiness_holds_across_membership_changes() {
 #[tokio::test]
 async fn new_session_after_repopulation_picks_from_new_set() {
     let pool = Arc::new(K8sPool::new());
-    let router = Router::new(pool.clone(), Arc::new(StubStore::default()));
+    let router = Router::single_pool(pool.clone(), Arc::new(StubStore::default()));
 
     // Pool empty at first.
     let early = SessionKey::new("u", "early");
-    assert!(router.resolve_session(&early).await.is_none());
+    assert!(router.resolve_session(&early).await.unwrap().is_none());
 
     // Watcher fires → new sessions can now route.
     pool.set_backends(vec!["a:1".into(), "b:1".into()]);
     let late = SessionKey::new("u", "late");
-    let chosen = router.resolve_session(&late).await.unwrap();
+    let chosen = router.resolve_session(&late).await.unwrap().unwrap();
     assert!(["a:1", "b:1"].contains(&chosen.as_str()));
 }

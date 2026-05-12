@@ -129,6 +129,30 @@ data:
     {{- fail (printf "affinityStore.type must be memory|redis, got %q" .Values.affinityStore.type) }}
     {{- end }}
 
+    {{- /* ---- tenant pools (overrides + fallback) ---- */}}
+    tenant_pools:
+      on_unknown_tenant: {{ .Values.tenantPools.onUnknownTenant | quote }}
+      {{- if .Values.tenantPools.overrides }}
+      overrides:
+        {{- range $tenant, $disc := .Values.tenantPools.overrides }}
+        {{ $tenant | quote }}:
+          {{- if eq $disc.type "static" }}
+          type: static
+          addresses:
+            {{- range $disc.addresses }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- else if eq $disc.type "k8s" }}
+          type: k8s
+          namespace: {{ $disc.namespace | quote }}
+          service_name: {{ $disc.serviceName | quote }}
+          port: {{ $disc.port }}
+          {{- else }}
+          {{- fail (printf "tenantPools.overrides.%s.type must be static|k8s, got %q" $tenant $disc.type) }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+
     {{- /* ---- tenant resolver ---- */}}
     tenant_resolver:
       {{- if eq .Values.tenantResolver.source "from_claim" }}

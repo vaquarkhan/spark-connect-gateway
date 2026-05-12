@@ -1,5 +1,6 @@
 //! Spark Connect Gateway entry point.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use scg_config::{
     AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, HealthCheckSettings, JwtSettings,
     KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TenantOnMissing,
     TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry, TracingSettings,
+    UnknownTenantPolicySetting,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
@@ -23,7 +25,7 @@ use scg_observability::{
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
-use scg_routing::{AffinityStore, Pool, Router};
+use scg_routing::{AffinityStore, Pool, Router, UnknownTenantPolicy};
 use scg_store_memory::MemoryStore;
 use scg_store_redis::{RedisStore, RedisStoreConfig};
 use scg_tenant::{
@@ -60,13 +62,9 @@ async fn main() -> Result<()> {
     // simply return Unavailable until backends are populated).
     let readiness = ReadinessProbe::default();
 
-    let (pool, _watcher) = build_pool(&cfg.discovery, &metrics, &readiness).await?;
-    // Wrap with active gRPC health-check probing if configured.
-    // Otherwise the inner pool is used directly (Phase-1 passive
-    // behaviour).
-    let pool = wrap_with_healthcheck(pool, &cfg.health_check);
+    let (tenant_router, _watchers) = build_tenant_routing(&cfg, &metrics, &readiness).await?;
     let store = build_affinity_store(&cfg.affinity_store).await?;
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::new(tenant_router, store));
     let dialer = Dialer::new();
 
     let auth = build_auth(&cfg.auth).await?;
@@ -185,18 +183,17 @@ async fn main() -> Result<()> {
 /// Build the configured `Pool` implementation. For dynamic sources
 /// (K8s) the watcher task is spawned and its `JoinHandle` is returned
 /// so the caller can keep it alive for the lifetime of the server.
-async fn build_pool(
+///
+/// Returned tuple: (pool, optional watcher join-handle, initial pool
+/// size for metrics).
+async fn build_pool_from_discovery(
     discovery: &BackendDiscovery,
-    metrics: &Metrics,
-    readiness: &ReadinessProbe,
-) -> Result<(Arc<dyn Pool>, Option<tokio::task::JoinHandle<()>>)> {
+) -> Result<(Arc<dyn Pool>, Option<tokio::task::JoinHandle<()>>, i64)> {
     match discovery {
         BackendDiscovery::Static { addresses } => {
+            let size = addresses.len() as i64;
             let pool = StaticPool::new(addresses.clone()).context("building static pool")?;
-            metrics.set_backend_pool_size(addresses.len() as i64);
-            // Static pool is always ready: addresses are known at load time.
-            readiness.mark_ready();
-            Ok((Arc::new(pool), None))
+            Ok((Arc::new(pool), None, size))
         }
         BackendDiscovery::K8s {
             namespace,
@@ -213,19 +210,81 @@ async fn build_pool(
                 .spawn_watcher(cfg)
                 .await
                 .context("spawning K8s Endpoints watcher")?;
-            // Optimistic: once the watcher task is scheduled we mark
-            // readiness, even if it hasn't yet emitted its first list
-            // event. /readyz still returns 200 here; clients hitting
-            // the gateway during the brief gap get Unavailable from
-            // the proxy ("no healthy backend available").
-            readiness.mark_ready();
-            // Initial pool size is zero; K8sPool emits a tracing event
-            // on each watcher update. Phase 2.5 will let the K8s pool
-            // notify the metrics handle directly.
-            metrics.set_backend_pool_size(0);
-            Ok((Arc::new(pool), Some(handle)))
+            Ok((Arc::new(pool), Some(handle), 0))
         }
     }
+}
+
+/// Build the per-tenant routing topology from `cfg`. Produces a
+/// [`TenantRouter`] plus a list of K8s-watcher join handles that
+/// must stay alive for the lifetime of the server (Tokio drops
+/// abort the watchers; we park them in a Vec the caller owns).
+///
+/// Pool selection per tenant:
+///
+/// * The deployment's *default* pool comes from `cfg.discovery`
+///   (the existing `backends:` / `backend_discovery:` config —
+///   back-compat with Phase 1/2 deployments).
+/// * Each entry in `cfg.tenant_pools.overrides` becomes a separate
+///   tenant-scoped pool, optionally wrapped in `HealthAwarePool`
+///   when active health probing is enabled.
+/// * The unknown-tenant policy from `tenant_pools.on_unknown_tenant`
+///   tells `TenantRouter` whether to fall back to the default pool
+///   or reject with `PermissionDenied`.
+///
+/// `readiness.mark_ready()` is called once at the end — readiness
+/// reflects "the gateway is ready to serve at all", not per-tenant
+/// pool readiness. The proxy still returns `Unavailable` per-RPC
+/// when a tenant's pool happens to be empty (K8s discovery during
+/// startup).
+///
+/// `metrics.set_backend_pool_size` is set to the *default* pool's
+/// size only — per-tenant gauges would need a `tenant` label and
+/// we explicitly bounded cardinality on `scg_backend_pool_size` in
+/// Phase 2.12. Per-tenant pool sizes show up in logs instead.
+async fn build_tenant_routing(
+    cfg: &Config,
+    metrics: &Metrics,
+    readiness: &ReadinessProbe,
+) -> Result<(scg_routing::TenantRouter, Vec<tokio::task::JoinHandle<()>>)> {
+    let mut watchers = Vec::new();
+
+    // Default pool from the existing discovery config.
+    let (default_pool, default_watcher, default_size) =
+        build_pool_from_discovery(&cfg.discovery).await?;
+    if let Some(h) = default_watcher {
+        watchers.push(h);
+    }
+    metrics.set_backend_pool_size(default_size);
+    let default_pool = wrap_with_healthcheck(default_pool, &cfg.health_check);
+    info!(size = default_size, "default tenant pool ready");
+
+    // Per-tenant overrides.
+    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    for (tenant, override_disc) in &cfg.tenant_pools.overrides {
+        let (pool, watcher, size) = build_pool_from_discovery(override_disc).await?;
+        if let Some(h) = watcher {
+            watchers.push(h);
+        }
+        let pool = wrap_with_healthcheck(pool, &cfg.health_check);
+        info!(
+            tenant = %tenant,
+            size,
+            "tenant override pool ready"
+        );
+        tenants.insert(tenant.clone(), pool);
+    }
+
+    readiness.mark_ready();
+
+    let policy = match cfg.tenant_pools.on_unknown_tenant {
+        UnknownTenantPolicySetting::UseDefault => UnknownTenantPolicy::UseDefault,
+        UnknownTenantPolicySetting::Reject => UnknownTenantPolicy::Reject,
+    };
+    Ok((
+        scg_routing::TenantRouter::new(tenants, Some(default_pool), policy),
+        watchers,
+    ))
 }
 
 /// Wrap `inner` with active health-check probing if enabled.

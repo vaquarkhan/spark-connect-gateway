@@ -189,7 +189,7 @@ async fn rig(
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_addr]).unwrap());
     let (recording, binds) = RecordingStore::new();
     let store: Arc<dyn AffinityStore> = Arc::new(recording);
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     let proxy = SparkConnectProxy::with_components(router, dialer, auth, metrics, resolver);
 

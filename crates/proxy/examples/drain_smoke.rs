@@ -164,7 +164,7 @@ async fn main() {
     let readiness = ReadinessProbe::new(true);
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_addr.clone()]).unwrap());
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     let proxy = SparkConnectProxy::with_auth_and_metrics(
         router,

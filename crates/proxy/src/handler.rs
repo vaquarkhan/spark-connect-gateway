@@ -205,8 +205,15 @@ fn stamp_user_context(uc: &mut Option<pb::UserContext>, id: &Identity) {
 /// A None is most commonly produced when a dynamic pool (Phase 2 K8s
 /// service-watch) hasn't seen any healthy endpoint yet, e.g. during
 /// gateway boot before the watcher's initial list event.
-fn require_addr(addr: Option<String>) -> Result<String, Status> {
-    addr.ok_or_else(|| Status::unavailable("no healthy backend available"))
+fn require_addr(addr: Result<Option<String>, Status>) -> Result<String, Status> {
+    // Two failure modes:
+    // * `Err(Status)` — the tenant has no configured pool and the
+    //   policy is `Reject`. Forward the `PermissionDenied` to the
+    //   client unchanged.
+    // * `Ok(None)` — the tenant's pool has no healthy backend
+    //   (K8s discovery during startup, Redis down so we can't
+    //   resolve stickiness, etc.). Surface as `Unavailable`.
+    addr?.ok_or_else(|| Status::unavailable("no healthy backend available"))
 }
 
 /// Map a Status code into the small fixed string used in metric labels.

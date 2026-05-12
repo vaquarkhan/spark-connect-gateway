@@ -205,7 +205,7 @@ async fn rig() -> Rig {
     let metrics = Metrics::new().unwrap();
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_addr]).unwrap());
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     // Auth disabled — these tests focus on tracing propagation, not
     // identity. The proxy still authenticates (Anonymous) and stamps

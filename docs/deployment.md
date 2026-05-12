@@ -242,6 +242,58 @@ change (issue tokens with tenant claims) before flipping
 `onMissing` to `reject`. Watch
 `scg_rpcs_total{code="Unauthenticated"}` during the change.
 
+## Per-tenant pools (Phase 3.2)
+
+Building on the tenant resolver above: each tenant can route to a
+*different* backend pool. A SaaS deployment isolates team-A's
+queries from team-B's by giving them different Spark Connect
+clusters; a per-team deployment shares one cluster.
+
+The `backendDiscovery:` setting at the top of `values.yaml` is the
+*default* pool. Add per-tenant overrides under `tenantPools`:
+
+```yaml
+backendDiscovery:
+  type: static
+  static:
+    addresses:
+      - "spark-shared-1.svc.cluster.local:15002"
+      - "spark-shared-2.svc.cluster.local:15002"
+
+tenantPools:
+  onUnknownTenant: reject   # strict: only configured tenants
+  overrides:
+    team-a:
+      type: static
+      addresses:
+        - "spark-team-a-1.svc.cluster.local:15002"
+        - "spark-team-a-2.svc.cluster.local:15002"
+    team-b:
+      type: k8s
+      namespace: spark-team-b
+      serviceName: spark-connect
+      port: 15002
+```
+
+`onUnknownTenant` is the routing equivalent of the resolver's
+`onMissing` policy:
+
+| Setting | Behaviour for a tenant not in `overrides` |
+|---|---|
+| `use_default` (default) | Route through the default pool. Back-compat with Phase 1/2 — every tenant shares the same backends. |
+| `reject` | `PermissionDenied` to the client. Use for strict SaaS-style isolation; pairs naturally with `tenantResolver.onMissing=reject`. |
+
+Each per-tenant pool gets the same active health-check treatment
+as the default pool (when `healthCheck.enabled: true`) — health
+probing runs independently per pool, so an unhealthy
+team-a backend doesn't affect team-b routing.
+
+**What back-compat looks like**: leaving `tenantPools.overrides`
+empty (the default) means every tenant — including the `default`
+tenant from the resolver — routes through the deployment's single
+pool. This is identical to Phase 1/2 behaviour. You opt into
+multi-tenant routing by listing tenants you want isolated.
+
 ## Active backend health checks
 
 By default the gateway routes to whatever its pool reports as

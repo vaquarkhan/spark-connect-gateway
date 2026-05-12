@@ -189,7 +189,7 @@ async fn spawn_gateway(
 ) -> (Channel, oneshot::Sender<()>) {
     let metrics = Metrics::new().unwrap();
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(backends).unwrap());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     let proxy = SparkConnectProxy::with_auth_and_metrics(
         router,

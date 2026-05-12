@@ -214,7 +214,7 @@ impl Drop for GatewayHandle {
 async fn start_gateway(backends: Vec<String>) -> GatewayHandle {
     let pool: Arc<dyn Pool> = Arc::new(StaticPool::new(backends).unwrap());
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     let svc = SparkConnectProxy::new(router, dialer);
     let server = pb::spark_connect_service_server::SparkConnectServiceServer::new(svc);

@@ -232,7 +232,7 @@ async fn spawn_rig(opts: RigOpts) -> Rig {
         inner
     };
     let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
-    let router = Arc::new(Router::new(pool, store));
+    let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
     let proxy = SparkConnectProxy::with_auth_and_metrics(
         router,

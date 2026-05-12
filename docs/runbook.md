@@ -20,6 +20,7 @@ config knobs see [`deployment.md`](deployment.md).
 * [`PermissionError` on K8s endpoints](#permissionerror-on-k8s-endpoints)
 * [P99 latency suddenly doubled](#p99-latency-suddenly-doubled)
 * [Clients suddenly getting Unauthenticated after a config change](#clients-suddenly-getting-unauthenticated-after-a-config-change)
+* [Tenant getting PermissionDenied with "no configured pool"](#tenant-getting-permissiondenied-with-no-configured-pool)
 * [Streams killed during rolling upgrade](#streams-killed-during-rolling-upgrade)
 * [Backend marked unhealthy but it's actually fine](#backend-marked-unhealthy-but-its-actually-fine)
 
@@ -357,6 +358,49 @@ kubectl -n spark-connect logs -l app.kubernetes.io/name=scg --tail=200 | grep "t
 `scg_auth_failures_total` increments for these too, but the log
 line is what distinguishes "token signature failed" from "token
 fine but missing tenant claim".
+
+## Tenant getting PermissionDenied with "no configured pool"
+
+**Symptom:** A client whose tenant claim used to work now gets
+`Status::PermissionDenied` with the message `tenant "X" has no
+configured pool`.
+
+**Why:** `tenantPools.onUnknownTenant` is set to `reject` and the
+tenant in question isn't listed under `tenantPools.overrides`.
+This happens after one of:
+
+* Someone added new tenants on the IdP side but didn't add a
+  matching pool entry to the gateway config.
+* The chart was upgraded with `onUnknownTenant: reject` enabled
+  but without listing every existing tenant.
+
+**Check:** which tenants are configured?
+
+```bash
+kubectl -n spark-connect get cm scg-config -o jsonpath='{.data.config\.yaml}' | grep -A 100 '^tenant_pools:'
+```
+
+Compare against the actual tenant strings hitting the gateway:
+
+```bash
+# Pull a few rejected RPCs from logs — `tenant_resolver` reports
+# the resolved tenant on every RPC, including the rejected ones.
+kubectl -n spark-connect logs -l app.kubernetes.io/name=scg --tail=500 | grep -i "permission_denied\|no configured pool"
+```
+
+**Fix (one of):**
+
+| Cause | Action |
+|---|---|
+| New tenant needs its own pool | Add it under `tenantPools.overrides`. `helm upgrade` rolls the pods with new config. |
+| New tenant should share the default pool | Switch `onUnknownTenant` back to `use_default`. Every uncatalogued tenant now lands on the default pool. |
+| Tenant string is wrong (IdP misconfiguration sending a typo) | Fix the IdP. The gateway is doing the right thing — rejecting an unknown tenant. |
+
+When you flip `onUnknownTenant` from `use_default` to `reject`,
+expect a brief uptick in `scg_rpcs_total{code="PermissionDenied"}`
+from any tenant you forgot to list. The deployment-time guard
+in the chart can't help here because the chart doesn't know which
+tenants your IdP will produce.
 
 ## Streams killed during rolling upgrade
 
