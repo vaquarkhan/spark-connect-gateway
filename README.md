@@ -387,13 +387,19 @@ cargo build -p scg-genproto
 
 ## Roadmap
 
-- **Phase 1 — MVP (this).** Streaming proxy, static pool, in-memory
+- **Phase 1 — MVP (done).** Streaming proxy, static pool, in-memory
   affinity, in-process tests against fake backends.
-- **Phase 2 — Production.** JWT/OIDC auth, K8s service-watch backend pool,
-  Redis/Postgres affinity store, Prometheus metrics, OpenTelemetry tracing,
-  Helm chart, multi-replica HA.
-- **Phase 3 — Multi-tenant.** Per-tenant backend pools, cold-start
-  provisioning, warm pools, rate limiting, audit logging.
+- **Phase 2 — Production (done).** JWT/OIDC auth, K8s service-watch
+  backend pool, Redis affinity store with multi-replica HA, Prometheus
+  metrics, OpenTelemetry tracing (root-span case), active gRPC health
+  checks, graceful shutdown drain, Helm chart, multi-replica HA test,
+  load harness + perf baseline, operator docs. Five items (2.7
+  Postgres store, 2.10 least-loaded, 2.11 gateway-side drain, 2.13
+  inbound-traceparent fix, 2.16 hot reload) intentionally deferred —
+  see [the plan][2] §4.4 for the rationale on each and when to
+  revisit.
+- **Phase 3 — Multi-tenant (next).** Per-tenant backend pools,
+  cold-start provisioning, warm pools, rate limiting, audit logging.
 
 See [the full plan][2] for details.
 
