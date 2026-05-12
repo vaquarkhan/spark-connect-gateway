@@ -19,6 +19,7 @@ config knobs see [`deployment.md`](deployment.md).
 * [Redis is down](#redis-is-down)
 * [`PermissionError` on K8s endpoints](#permissionerror-on-k8s-endpoints)
 * [P99 latency suddenly doubled](#p99-latency-suddenly-doubled)
+* [Clients suddenly getting Unauthenticated after a config change](#clients-suddenly-getting-unauthenticated-after-a-config-change)
 * [Streams killed during rolling upgrade](#streams-killed-during-rolling-upgrade)
 * [Backend marked unhealthy but it's actually fine](#backend-marked-unhealthy-but-its-actually-fine)
 
@@ -323,6 +324,39 @@ hot paths are auth, request_id generation, and the tonic forward —
 unusual time anywhere else is a clue.
 
 ---
+
+## Clients suddenly getting Unauthenticated after a config change
+
+**Symptom:** A `helm upgrade` rolled out a change touching auth or
+the tenant resolver. Immediately after, `scg_auth_failures_total`
+spikes and clients see `Status::Unauthenticated`, even though their
+tokens haven't changed and `auth.type` looks correct.
+
+**Why:** The Phase-3 tenant resolver added a second place where
+`Unauthenticated` can come from. Two policies trigger it:
+
+| Cause | Symptom in logs |
+|---|---|
+| `tenantResolver.source=from_claim` + `onMissing=reject` + token missing tenant claim | `tenant_resolver: rejecting RPC — no tenant available` |
+| `tenantResolver.source=from_metadata` + `onMissing=reject` + client didn't send the header | Same log line; check the resolver's `metadataHeader` |
+
+**Check:**
+```bash
+kubectl -n spark-connect logs -l app.kubernetes.io/name=scg --tail=200 | grep "tenant_resolver: rejecting"
+```
+
+**Fix:**
+
+* **If you meant to enforce strict tenancy** — fix the upstream
+  IdP to emit tenant claims (or fix clients to send the header).
+  This is the design intent.
+* **If the change to `onMissing=reject` was premature** — roll
+  back to `use_default` until the upstream is ready, then flip
+  forward. The deployment guide flags this transition.
+
+`scg_auth_failures_total` increments for these too, but the log
+line is what distinguishes "token signature failed" from "token
+fine but missing tenant claim".
 
 ## Streams killed during rolling upgrade
 

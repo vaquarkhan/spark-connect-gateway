@@ -129,6 +129,21 @@ data:
     {{- fail (printf "affinityStore.type must be memory|redis, got %q" .Values.affinityStore.type) }}
     {{- end }}
 
+    {{- /* ---- tenant resolver ---- */}}
+    tenant_resolver:
+      {{- if eq .Values.tenantResolver.source "from_claim" }}
+      source: from_claim
+      {{- else if eq .Values.tenantResolver.source "from_metadata" }}
+      source: from_metadata
+      header: {{ .Values.tenantResolver.metadataHeader | quote }}
+      {{- else if eq .Values.tenantResolver.source "always_default" }}
+      source: always_default
+      {{- else }}
+      {{- fail (printf "tenantResolver.source must be from_claim|from_metadata|always_default, got %q" .Values.tenantResolver.source) }}
+      {{- end }}
+      on_missing: {{ .Values.tenantResolver.onMissing | quote }}
+      default_name: {{ .Values.tenantResolver.defaultName | quote }}
+
     {{- /* ---- health-check ---- */}}
     {{- if .Values.healthCheck.enabled }}
     health_check:

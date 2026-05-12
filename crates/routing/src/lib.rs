@@ -10,22 +10,48 @@
 
 use std::sync::Arc;
 
-/// Identifies a Spark Connect session. The pair `(user_id, session_id)` is
-/// what backend Spark Connect servers themselves use to key `SparkSession`,
-/// so the gateway must keep the same routing decision stable across the
-/// lifetime of that pair.
+/// Identifies a Spark Connect session within a tenant. The triple
+/// `(tenant, user_id, session_id)` is the affinity routing key. The
+/// `tenant` component was added in Phase 3 — pre-Phase-3 deployments
+/// implicitly use the literal string `"default"` (see
+/// [`SessionKey::new`]).
 ///
-/// `user_id` may be empty if the client did not set it; `session_id` must
-/// not be empty for the affinity store to route a request.
+/// Spark Connect itself keys `SparkSession` only on `(user_id,
+/// session_id)`. Adding the tenant prefix lets multiple tenants share
+/// a gateway without their `session_id` namespaces colliding —
+/// `(team-a, alice, sess-1)` is a different key from `(team-b,
+/// alice, sess-1)`.
+///
+/// `user_id` may be empty if the client did not set it; `session_id`
+/// must not be empty for the affinity store to route a request.
+/// `tenant` is always non-empty in production (the tenant resolver
+/// guarantees this).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
+    pub tenant: String,
     pub user_id: String,
     pub session_id: String,
 }
 
 impl SessionKey {
+    /// Build a [`SessionKey`] without an explicit tenant — used by
+    /// pre-Phase-3 call sites (tests, single-tenant deployments).
+    /// The tenant is set to `"default"`, matching the back-compat
+    /// behaviour of `TenantResolverConfig::default()`.
     pub fn new(user_id: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self::with_tenant("default", user_id, session_id)
+    }
+
+    /// Build a [`SessionKey`] for an explicit tenant. This is what
+    /// production handlers call after the tenant resolver yields a
+    /// tenant string.
+    pub fn with_tenant(
+        tenant: impl Into<String>,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
         Self {
+            tenant: tenant.into(),
             user_id: user_id.into(),
             session_id: session_id.into(),
         }

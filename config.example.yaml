@@ -20,7 +20,17 @@ backends:
 #   service_name: spark-connect
 #   port: 15002
 
-# Where to keep the (user_id, session_id) -> backend affinity table.
+# How the gateway figures out which tenant each inbound RPC belongs
+# to. Default = tenant comes from auth claim, falls back to "default"
+# when missing — preserves Phase 1/2 single-tenant behaviour.
+#
+# tenant_resolver:
+#   source: from_claim          # or: from_metadata | always_default
+#   # header: x-tenant          # only when source=from_metadata
+#   on_missing: use_default     # or: reject (for strict SaaS-style isolation)
+#   default_name: default
+
+# Where to keep the (tenant, user_id, session_id) -> backend affinity table.
 # Default `memory` works for a single gateway replica. For replicas > 1
 # (HA / multi-pod deployments), point at a Redis instance so all
 # replicas see the same bindings — without it, a client that lands on

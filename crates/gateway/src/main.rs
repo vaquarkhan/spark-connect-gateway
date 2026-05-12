@@ -12,8 +12,8 @@ use scg_auth::{
 };
 use scg_config::{
     AffinityStoreConfig, AuthConfig, BackendDiscovery, Config, HealthCheckSettings, JwtSettings,
-    KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TokenEntry as CfgTokenEntry,
-    TracingSettings,
+    KeySource as CfgKeySource, OidcSettings, RedisStoreSettings, TenantOnMissing,
+    TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry, TracingSettings,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
@@ -26,6 +26,9 @@ use scg_proxy::{Dialer, SparkConnectProxy};
 use scg_routing::{AffinityStore, Pool, Router};
 use scg_store_memory::MemoryStore;
 use scg_store_redis::{RedisStore, RedisStoreConfig};
+use scg_tenant::{
+    OnMissing as TenantOnMissingRt, TenantResolver, TenantResolverConfig, TenantSource,
+};
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::{info, warn};
@@ -67,11 +70,13 @@ async fn main() -> Result<()> {
     let dialer = Dialer::new();
 
     let auth = build_auth(&cfg.auth).await?;
-    let svc = SparkConnectProxy::with_auth_and_metrics(
+    let tenant_resolver = build_tenant_resolver(&cfg.tenant_resolver);
+    let svc = SparkConnectProxy::with_components(
         router,
         dialer,
         AuthInterceptor::new(auth),
         metrics.clone(),
+        tenant_resolver,
     );
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
@@ -267,6 +272,31 @@ fn redis_store_config(s: &RedisStoreSettings) -> RedisStoreConfig {
     }
 }
 
+/// Translate the YAML `tenant_resolver:` block into a runtime
+/// [`TenantResolver`]. The tagged `source` enum maps to the
+/// equivalent `scg-tenant` variant. With no `tenant_resolver:`
+/// block in config the gateway gets the back-compat default — every
+/// inbound RPC ends up in `tenant="default"`, preserving Phase 1/2
+/// single-tenant behaviour.
+fn build_tenant_resolver(cfg: &TenantResolverSettings) -> TenantResolver {
+    let source = match &cfg.source {
+        TenantResolverSource::FromClaim => TenantSource::FromClaim,
+        TenantResolverSource::FromMetadata { header } => TenantSource::FromMetadata {
+            header: header.clone(),
+        },
+        TenantResolverSource::AlwaysDefault => TenantSource::AlwaysDefault,
+    };
+    let on_missing = match cfg.on_missing {
+        TenantOnMissing::UseDefault => TenantOnMissingRt::UseDefault,
+        TenantOnMissing::Reject => TenantOnMissingRt::Reject,
+    };
+    TenantResolver::new(TenantResolverConfig {
+        source,
+        on_missing,
+        default_name: cfg.default_name.clone(),
+    })
+}
+
 /// Construct the right Authenticator from config.
 async fn build_auth(cfg: &AuthConfig) -> Result<Arc<dyn Authenticator>> {
     match cfg {
@@ -344,6 +374,15 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
         AffinityStoreConfig::Memory => "memory",
         AffinityStoreConfig::Redis(_) => "redis",
     };
+    let tenant_source = match &cfg.tenant_resolver.source {
+        TenantResolverSource::FromClaim => "from_claim",
+        TenantResolverSource::FromMetadata { .. } => "from_metadata",
+        TenantResolverSource::AlwaysDefault => "always_default",
+    };
+    let tenant_on_missing = match &cfg.tenant_resolver.on_missing {
+        TenantOnMissing::UseDefault => "use_default",
+        TenantOnMissing::Reject => "reject",
+    };
     match &cfg.discovery {
         BackendDiscovery::Static { addresses } => {
             info!(
@@ -352,6 +391,8 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 discovery = "static",
                 auth = auth_kind,
                 affinity_store = store_kind,
+                tenant_source,
+                tenant_on_missing,
                 backends = ?addresses,
                 "spark-connect-gateway starting"
             );
@@ -367,6 +408,8 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 discovery = "k8s",
                 auth = auth_kind,
                 affinity_store = store_kind,
+                tenant_source,
+                tenant_on_missing,
                 namespace = %namespace,
                 service = %service_name,
                 port,

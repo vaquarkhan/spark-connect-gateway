@@ -155,6 +155,25 @@ redis:
     accessModes:
       - ReadWriteOnce
 
+# How the gateway figures out which tenant each inbound RPC belongs
+# to. The resolved tenant becomes the first segment of the routing
+# key, so two tenants with the same session_id stay isolated.
+#
+# Defaults give back-compat (every RPC → tenant="default"), matching
+# Phase 1/2 single-tenant behaviour. Switch `source` to from_metadata
+# when auth is disabled but clients self-declare a tenant via a gRPC
+# header; switch to always_default for a single-tenant deployment
+# running Phase 3 code; switch `on_missing: reject` for SaaS-style
+# strict isolation where a missing tenant claim is a misconfiguration.
+tenantResolver:
+  # one of: from_claim | from_metadata | always_default
+  source: from_claim
+  # Header name when source=from_metadata. Default x-tenant.
+  metadataHeader: x-tenant
+  # one of: use_default | reject
+  onMissing: use_default
+  defaultName: default
+
 # Active gRPC health-check probing for backend pool members. When
 # enabled, the gateway calls `grpc.health.v1.Health/Check` on each
 # backend periodically and removes repeatedly-failing ones from the

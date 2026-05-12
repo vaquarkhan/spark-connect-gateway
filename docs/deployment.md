@@ -213,6 +213,35 @@ Production rule of thumb: `oidc` if you have an IdP, `jwt` if you're
 issuing JWTs in-house, `static` for a closed dev setup, `none` only
 for namespace-isolated clusters.
 
+## Multi-tenant: picking a tenant resolver (Phase 3)
+
+The routing key the gateway uses for session affinity is now
+`(tenant, user_id, session_id)`. The tenant prefix lets two
+tenants share a gateway without their `session_id` namespaces
+colliding — `(team-a, alice, sess-1)` is a different key from
+`(team-b, alice, sess-1)`.
+
+The `tenantResolver` config block tells the gateway *how* to figure
+out which tenant each RPC belongs to. Pick by deployment shape:
+
+| Deployment shape | `source` | `onMissing` | Notes |
+|---|---|---|---|
+| **Phase 1/2 upgrading to Phase 3 code**, single-tenant | `from_claim` | `use_default` | The default. Tenant comes from the auth claim if there is one, otherwise falls back to `"default"`. Nothing changes operationally — every RPC ends up in `tenant="default"`. |
+| **JWT/OIDC multi-tenant** with a `tenant` claim | `from_claim` | `reject` | Tenant from JWT. Reject any RPC whose verified identity has no tenant claim — that's almost always an IdP misconfiguration in SaaS-style deployments. |
+| **No auth but client cooperates** via metadata | `from_metadata` | `use_default` or `reject` | Tenant from a gRPC metadata header (default `x-tenant`). Use `reject` if every client *must* send the header; `use_default` is appropriate when missing-header clients are legitimate internal tools that should land in a default pool. |
+| **Single-tenant deployment running Phase 3 code** | `always_default` | n/a | Ignore claim and header; every RPC goes to `defaultName`. Use this when you want Phase 3 code but no multi-tenant routing. |
+
+The chart's default values are the first row above, so a fresh
+install retains Phase 1/2 single-tenant behaviour with zero
+config changes.
+
+**Migration note**: when you switch a running deployment from
+`use_default` to `reject`, any client whose token doesn't carry a
+tenant claim starts getting `Unauthenticated`. Roll the auth-side
+change (issue tokens with tenant claims) before flipping
+`onMissing` to `reject`. Watch
+`scg_rpcs_total{code="Unauthenticated"}` during the change.
+
 ## Active backend health checks
 
 By default the gateway routes to whatever its pool reports as

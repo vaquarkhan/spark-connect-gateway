@@ -96,7 +96,19 @@ impl RedisStore {
     }
 
     fn session_key(&self, k: &SessionKey) -> String {
-        format!("{}:s:{}|{}", self.cfg.key_prefix, k.user_id, k.session_id)
+        // {prefix}:s:{tenant}|{user_id}|{session_id}
+        //
+        // Note: Phase 2 deployments upgrading to Phase 3 will see
+        // their existing session bindings appear under a different
+        // key (the old format had no tenant segment). The old keys
+        // expire naturally via TTL; the impact is one round of
+        // re-pinning per active session. Rolling-restart with the
+        // old key_prefix would mix schemas — bump key_prefix during
+        // the upgrade if that matters.
+        format!(
+            "{}:s:{}|{}|{}",
+            self.cfg.key_prefix, k.tenant, k.user_id, k.session_id
+        )
     }
 
     fn op_key(&self, op_id: &str) -> String {

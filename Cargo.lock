@@ -885,6 +885,7 @@ dependencies = [
  "scg-routing",
  "scg-store-memory",
  "scg-store-redis",
+ "scg-tenant",
  "tokio",
  "tonic",
  "tracing",
@@ -2687,6 +2688,7 @@ dependencies = [
  "scg-routing",
  "scg-store-memory",
  "scg-store-redis",
+ "scg-tenant",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2726,6 +2728,16 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scg-tenant"
+version = "0.1.0"
+dependencies = [
+ "scg-auth",
+ "thiserror 2.0.18",
+ "tonic",
  "tracing",
 ]
 

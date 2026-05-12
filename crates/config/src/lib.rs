@@ -192,6 +192,75 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
+/// How the gateway figures out which tenant an inbound RPC belongs
+/// to. The resolved tenant becomes the first segment of the routing
+/// key, so two tenants with the same `session_id` get isolated
+/// affinity buckets.
+///
+/// Phase 1/2 deployments without a `tenant_resolver:` block fall
+/// back to `from_claim + use_default + "default"`, which is the
+/// pre-Phase-3 behaviour (every RPC ends up in `tenant="default"`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TenantResolverSource {
+    /// Read from `Identity.tenant` produced by the auth interceptor
+    /// (JWT/OIDC `tenant` claim, static-token `tenant` field).
+    FromClaim,
+    /// Read from a gRPC metadata header. For deployments where auth
+    /// is disabled but clients still cooperate by declaring a
+    /// tenant.
+    FromMetadata {
+        #[serde(default = "default_tenant_header")]
+        header: String,
+    },
+    /// Always use `default_name`. Single-tenant deployments running
+    /// Phase 3 code without bothering with auth claims or headers.
+    AlwaysDefault,
+}
+
+fn default_tenant_header() -> String {
+    "x-tenant".into()
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantOnMissing {
+    /// Fall back to `default_name` when the source yields nothing.
+    /// Back-compat default for Phase 1/2 upgrades.
+    UseDefault,
+    /// Fail the RPC with `Unauthenticated`. Used by SaaS-style
+    /// deployments where a missing tenant claim almost always means
+    /// the IdP is misconfigured.
+    Reject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantResolverSettings {
+    #[serde(flatten)]
+    pub source: TenantResolverSource,
+    #[serde(default = "default_tenant_on_missing")]
+    pub on_missing: TenantOnMissing,
+    #[serde(default = "default_tenant_name")]
+    pub default_name: String,
+}
+
+fn default_tenant_on_missing() -> TenantOnMissing {
+    TenantOnMissing::UseDefault
+}
+fn default_tenant_name() -> String {
+    "default".into()
+}
+
+impl Default for TenantResolverSettings {
+    fn default() -> Self {
+        Self {
+            source: TenantResolverSource::FromClaim,
+            on_missing: TenantOnMissing::UseDefault,
+            default_name: default_tenant_name(),
+        }
+    }
+}
+
 /// Active gRPC health-check probing for backend pool members. Wraps
 /// the configured pool with a probe loop that calls
 /// `grpc.health.v1.Health/Check` on each backend and removes
@@ -325,6 +394,8 @@ struct RawConfig {
     health_check: Option<HealthCheckSettings>,
     #[serde(default)]
     shutdown: Option<ShutdownSettings>,
+    #[serde(default)]
+    tenant_resolver: Option<TenantResolverSettings>,
 }
 
 fn default_admin_addr_opt() -> Option<String> {
@@ -348,6 +419,9 @@ pub struct Config {
     pub health_check: HealthCheckSettings,
     /// Graceful shutdown / drain settings.
     pub shutdown: ShutdownSettings,
+    /// How to figure out the tenant for each inbound RPC. Defaults
+    /// to the back-compat behaviour (every RPC -> tenant="default").
+    pub tenant_resolver: TenantResolverSettings,
 }
 
 fn default_bind_addr() -> String {
@@ -401,6 +475,7 @@ impl Config {
             affinity_store: raw.affinity_store.unwrap_or_default(),
             health_check: raw.health_check.unwrap_or_default(),
             shutdown: raw.shutdown.unwrap_or_default(),
+            tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
         })
     }
 }
@@ -750,6 +825,97 @@ shutdown:
         );
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.shutdown.deadline_secs, 90);
+    }
+
+    #[test]
+    fn tenant_resolver_defaults_to_from_claim_use_default() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(matches!(
+            c.tenant_resolver.source,
+            TenantResolverSource::FromClaim
+        ));
+        assert!(matches!(
+            c.tenant_resolver.on_missing,
+            TenantOnMissing::UseDefault
+        ));
+        assert_eq!(c.tenant_resolver.default_name, "default");
+    }
+
+    #[test]
+    fn loads_from_claim_reject() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+tenant_resolver:
+  source: from_claim
+  on_missing: reject
+  default_name: "default"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(matches!(
+            c.tenant_resolver.source,
+            TenantResolverSource::FromClaim
+        ));
+        assert!(matches!(
+            c.tenant_resolver.on_missing,
+            TenantOnMissing::Reject
+        ));
+    }
+
+    #[test]
+    fn loads_from_metadata_with_custom_header() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+tenant_resolver:
+  source: from_metadata
+  header: "x-org"
+  on_missing: use_default
+  default_name: "shared"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.tenant_resolver.source {
+            TenantResolverSource::FromMetadata { header } => assert_eq!(header, "x-org"),
+            other => panic!("expected FromMetadata, got {:?}", other),
+        }
+        assert_eq!(c.tenant_resolver.default_name, "shared");
+    }
+
+    #[test]
+    fn from_metadata_header_defaults_to_x_tenant() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+tenant_resolver:
+  source: from_metadata
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        match c.tenant_resolver.source {
+            TenantResolverSource::FromMetadata { header } => assert_eq!(header, "x-tenant"),
+            other => panic!("expected FromMetadata, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn loads_always_default() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+tenant_resolver:
+  source: always_default
+  default_name: "single-tenant"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(matches!(
+            c.tenant_resolver.source,
+            TenantResolverSource::AlwaysDefault
+        ));
+        assert_eq!(c.tenant_resolver.default_name, "single-tenant");
     }
 
     #[test]

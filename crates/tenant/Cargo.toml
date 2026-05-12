@@ -1,0 +1,12 @@
+[package]
+name = "scg-tenant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scg-auth = { path = "../auth" }
+tonic = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
