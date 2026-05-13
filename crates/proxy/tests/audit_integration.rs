@@ -14,13 +14,14 @@
 //! formatter would pick up. We don't install the JSON formatter here
 //! because we want structured access to fields, not stringified lines.
 
-use std::collections::HashMap;
+mod common;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::AuditCapture;
 use futures::Stream;
-use parking_lot::Mutex;
 use scg_audit::{AuditConfig, AuditLogger};
 use scg_auth::token::{StaticTokenAuthenticator, TokenEntry};
 use scg_auth::{AnonymousAuthenticator, AuthInterceptor};
@@ -36,9 +37,6 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
-use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Layer;
 
 /// Backend that either OKs the request (Config / ReleaseSession) or
 /// returns a non-OK status the gateway must surface as `rpc.error`.
@@ -129,56 +127,6 @@ impl pb::spark_connect_service_server::SparkConnectService for PartialBackend {
     ) -> Result<Response<pb::AddArtifactsResponse>, Status> {
         Err(Status::unimplemented("n/a"))
     }
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    fields: HashMap<String, String>,
-}
-
-impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        if event.metadata().target() != "scg::audit" {
-            return;
-        }
-        let mut fields = HashMap::new();
-        struct Vis<'a>(&'a mut HashMap<String, String>);
-        impl<'a> tracing::field::Visit for Vis<'a> {
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                self.0.insert(f.name().into(), format!("{:?}", v));
-            }
-            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
-                self.0.insert(f.name().into(), v.into());
-            }
-        }
-        event.record(&mut Vis(&mut fields));
-        self.events.lock().push(CapturedEvent { fields });
-    }
-}
-
-impl CaptureLayer {
-    fn snapshot(&self) -> Vec<CapturedEvent> {
-        self.events.lock().clone()
-    }
-}
-
-/// Install the capture layer for the lifetime of the returned guard.
-/// The guard scopes the subscriber to the current thread / task —
-/// dropping it restores the previous subscriber.
-fn install_capture() -> (CaptureLayer, DefaultGuard) {
-    let cap = CaptureLayer::default();
-    let sub = tracing_subscriber::registry().with(cap.clone());
-    let guard = tracing::subscriber::set_default(sub);
-    (cap, guard)
 }
 
 struct Rig {
@@ -278,22 +226,9 @@ fn release_request(session: &str, tenant: &str) -> Request<pb::ReleaseSessionReq
     req
 }
 
-fn count_events(events: &[CapturedEvent], event_name: &str) -> usize {
-    events
-        .iter()
-        .filter(|e| e.fields.get("event").map(|s| s.as_str()) == Some(event_name))
-        .count()
-}
-
-fn find_event<'a>(events: &'a [CapturedEvent], event_name: &str) -> Option<&'a CapturedEvent> {
-    events
-        .iter()
-        .find(|e| e.fields.get("event").map(|s| s.as_str()) == Some(event_name))
-}
-
 #[tokio::test]
 async fn session_create_fires_once_per_binding() {
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     let auth = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
     let rig = spawn_rig(auth).await;
     let mut c =
@@ -309,12 +244,12 @@ async fn session_create_fires_once_per_binding() {
 
     let events = cap.snapshot();
     assert_eq!(
-        count_events(&events, "session.create"),
+        cap.count_events("session.create"),
         2,
         "expected exactly two session.create events (sess-1 + sess-2), got events: {:?}",
         events.iter().map(|e| &e.fields).collect::<Vec<_>>(),
     );
-    let first = find_event(&events, "session.create").unwrap();
+    let first = cap.find_event("session.create").unwrap();
     assert_eq!(
         first.fields.get("tenant").map(|s| s.as_str()),
         Some("default")
@@ -333,7 +268,7 @@ async fn session_create_carries_groups_from_token() {
     // Static-token auth with a token that declares groups. The audit
     // event must carry them so operators querying the audit stream
     // can see who has which memberships.
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     let auth_inner = StaticTokenAuthenticator::new(vec![TokenEntry {
         token: "dev-token".into(),
         user_id: "alice".into(),
@@ -353,8 +288,7 @@ async fn session_create_carries_groups_from_token() {
     );
     c.config(req).await.unwrap();
 
-    let events = cap.snapshot();
-    let evt = find_event(&events, "session.create").unwrap();
+    let evt = cap.find_event("session.create").unwrap();
     assert_eq!(evt.fields.get("user_id").map(|s| s.as_str()), Some("alice"));
     assert_eq!(
         evt.fields.get("groups").map(|s| s.as_str()),
@@ -364,7 +298,7 @@ async fn session_create_carries_groups_from_token() {
 
 #[tokio::test]
 async fn release_session_emits_release_event() {
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     let auth = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
     let rig = spawn_rig(auth).await;
     let mut c =
@@ -377,9 +311,8 @@ async fn release_session_emits_release_event() {
         .await
         .unwrap();
 
-    let events = cap.snapshot();
-    assert_eq!(count_events(&events, "session.release"), 1);
-    let rel = find_event(&events, "session.release").unwrap();
+    assert_eq!(cap.count_events("session.release"), 1);
+    let rel = cap.find_event("session.release").unwrap();
     assert_eq!(
         rel.fields.get("session_id").map(|s| s.as_str()),
         Some("sess-rel")
@@ -388,7 +321,7 @@ async fn release_session_emits_release_event() {
 
 #[tokio::test]
 async fn auth_failure_emits_audit_event() {
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     // Static-token auth with one valid token; an unauthenticated
     // client request should fail.
     let auth_inner = StaticTokenAuthenticator::new(vec![TokenEntry {
@@ -410,9 +343,8 @@ async fn auth_failure_emits_audit_event() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
-    let events = cap.snapshot();
-    assert_eq!(count_events(&events, "auth.failure"), 1);
-    let auth_evt = find_event(&events, "auth.failure").unwrap();
+    assert_eq!(cap.count_events("auth.failure"), 1);
+    let auth_evt = cap.find_event("auth.failure").unwrap();
     assert_eq!(
         auth_evt.fields.get("rpc").map(|s| s.as_str()),
         Some("Config")
@@ -420,12 +352,12 @@ async fn auth_failure_emits_audit_event() {
     assert!(auth_evt.fields.contains_key("reason"));
     // Pre-identity failure: no rpc.error follow-up (auth.failure
     // already covers this).
-    assert_eq!(count_events(&events, "rpc.error"), 0);
+    assert_eq!(cap.count_events("rpc.error"), 0);
 }
 
 #[tokio::test]
 async fn rpc_error_emits_audit_event_with_code() {
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     let auth = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
     let rig = spawn_rig(auth).await;
     let mut c =
@@ -438,9 +370,8 @@ async fn rpc_error_emits_audit_event_with_code() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Internal);
 
-    let events = cap.snapshot();
-    assert_eq!(count_events(&events, "rpc.error"), 1);
-    let rpc_err = find_event(&events, "rpc.error").unwrap();
+    assert_eq!(cap.count_events("rpc.error"), 1);
+    let rpc_err = cap.find_event("rpc.error").unwrap();
     assert_eq!(
         rpc_err.fields.get("rpc").map(|s| s.as_str()),
         Some("AnalyzePlan")

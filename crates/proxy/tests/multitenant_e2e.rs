@@ -30,13 +30,15 @@
 //!    `OnMissing::Reject`, the gateway returns PermissionDenied or
 //!    Unauthenticated before the request ever reaches a backend.
 
+mod common;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{AuditCapture, CapturedEvent};
 use futures::Stream;
-use parking_lot::Mutex;
 use scg_audit::{AuditConfig, AuditLogger};
 use scg_auth::token::{StaticTokenAuthenticator, TokenEntry};
 use scg_auth::AuthInterceptor;
@@ -53,9 +55,6 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
-use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Layer;
 
 /// Backend that tags its `ConfigResponse.session_id` with its own id
 /// so the test driver can identify which backend handled an RPC.
@@ -170,56 +169,6 @@ async fn spawn_backend(id: &'static str) -> (String, tokio::sync::oneshot::Sende
             .ok();
     });
     (addr, tx)
-}
-
-/// Capture-only tracing Layer that intercepts `target = "scg::audit"`
-/// events, mirroring the production JSON formatter's filter without
-/// formatting them.
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    fields: HashMap<String, String>,
-}
-
-impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        if event.metadata().target() != "scg::audit" {
-            return;
-        }
-        let mut fields = HashMap::new();
-        struct Vis<'a>(&'a mut HashMap<String, String>);
-        impl<'a> tracing::field::Visit for Vis<'a> {
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                self.0.insert(f.name().into(), format!("{:?}", v));
-            }
-            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
-                self.0.insert(f.name().into(), v.into());
-            }
-        }
-        event.record(&mut Vis(&mut fields));
-        self.events.lock().push(CapturedEvent { fields });
-    }
-}
-
-impl CaptureLayer {
-    fn snapshot(&self) -> Vec<CapturedEvent> {
-        self.events.lock().clone()
-    }
-}
-
-fn install_capture() -> (CaptureLayer, DefaultGuard) {
-    let cap = CaptureLayer::default();
-    let sub = tracing_subscriber::registry().with(cap.clone());
-    let guard = tracing::subscriber::set_default(sub);
-    (cap, guard)
 }
 
 /// Metrics-backed rate-limit observer, mirroring how `gateway/main.rs`
@@ -433,6 +382,11 @@ fn audit_events_for_tenant<'a>(
 
 #[tokio::test]
 async fn same_session_id_across_tenants_lands_on_different_backends() {
+    // Hold the capture lease for the test's lifetime so audit events
+    // emitted by this test's rig don't pollute another test's
+    // snapshot. The lease serializes tests within this file even
+    // though we don't read events here.
+    let _cap = AuditCapture::lease();
     let rig = spawn_rig(UnknownTenantPolicy::UseDefault).await;
 
     // Both clients pick the *same* session_id; the only thing
@@ -464,6 +418,7 @@ async fn same_session_id_across_tenants_lands_on_different_backends() {
 
 #[tokio::test]
 async fn one_tenant_exhausting_quota_does_not_affect_the_other() {
+    let _cap = AuditCapture::lease();
     let rig = spawn_rig(UnknownTenantPolicy::UseDefault).await;
 
     // team-a is configured with burst=3. The first 3 succeed; the
@@ -498,7 +453,7 @@ async fn one_tenant_exhausting_quota_does_not_affect_the_other() {
 
 #[tokio::test]
 async fn audit_events_label_the_correct_tenant() {
-    let (cap, _guard) = install_capture();
+    let cap = AuditCapture::lease();
     let rig = spawn_rig(UnknownTenantPolicy::UseDefault).await;
 
     config_as(&rig.channel, "sess-a", "tok-a").await.unwrap();
@@ -548,6 +503,7 @@ async fn audit_events_label_the_correct_tenant() {
 
 #[tokio::test]
 async fn unauthenticated_request_is_rejected_before_routing() {
+    let _cap = AuditCapture::lease();
     let rig = spawn_rig(UnknownTenantPolicy::UseDefault).await;
     let err = config_no_auth(&rig.channel, "anything").await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -555,6 +511,7 @@ async fn unauthenticated_request_is_rejected_before_routing() {
 
 #[tokio::test]
 async fn unknown_tenant_token_rejected_under_reject_policy() {
+    let _cap = AuditCapture::lease();
     // Add a third token whose tenant claim is missing — the
     // resolver's Reject policy must turn that into a hard rejection
     // before the request reaches a backend.
