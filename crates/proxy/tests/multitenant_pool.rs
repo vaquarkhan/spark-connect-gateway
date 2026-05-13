@@ -1,4 +1,4 @@
-//! Integration test for Phase 3.2 per-tenant pool routing.
+//! Integration test for per-tenant pool routing.
 //!
 //! Spawns three fake backends (team-a-be, team-b-be, default-be),
 //! wires them into a single gateway with a per-tenant pool map, and
@@ -271,7 +271,7 @@ async fn reject_policy_returns_permission_denied_for_unknown_tenant() {
 #[tokio::test]
 async fn back_compat_single_pool_via_default_only() {
     // Empty `overrides` map: every tenant routes through the
-    // configured default. This is the Phase 1/2 behaviour.
+    // configured default. This is the single-tenant baseline.
     let (be_default, _kd) = spawn_backend("be-default").await;
     let default_pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_default]).unwrap());
     let tr = TenantRouter::new(

@@ -12,8 +12,10 @@
 //! That keeps the framework boundary clean: the proxy is responsible
 //! for reading the inbound metadata, calling `authenticate`, attaching
 //! the resulting identity, and *then* dispatching to the per-RPC
-//! method body. Phase 2's small handful of RPCs makes this manageable;
-//! a tower-layer-based async interceptor is on the Phase 4 list.
+//! method body. The Spark Connect service surface is small enough
+//! (under twenty RPCs) that calling `authenticate` per handler is
+//! manageable; a tower-layer-based async interceptor would be a
+//! future refactor.
 
 use std::sync::Arc;
 use tonic::metadata::MetadataMap;

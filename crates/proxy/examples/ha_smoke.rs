@@ -1,11 +1,11 @@
-//! Multi-replica HA smoke test (Phase 2.18).
+//! Multi-replica HA smoke test.
 //!
 //! Spawns two real SparkConnectProxy gateways, both backed by:
-//!   * the same Redis (RedisStore — Phase 2.6),
+//!   * the same Redis affinity store (`scg-store-redis`),
 //!   * the same static pool of two fake Spark Connect backends.
 //!
 //! Then drives a series of RPCs through different replicas and
-//! verifies the three properties Phase 2.18 was created to prove:
+//! verifies three HA properties:
 //!
 //!   A. **Shared state.** A session bound through replica A resolves
 //!      to the *same* backend through replica B.

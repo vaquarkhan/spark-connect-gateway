@@ -1,4 +1,4 @@
-//! Redis-backed distributed token bucket (Phase 3.7).
+//! Redis-backed distributed token bucket.
 //!
 //! The in-memory limiter in the parent module enforces quotas per
 //! *gateway replica*. A 3-replica deployment with `rpcsPerSecond: 100`
@@ -35,9 +35,9 @@
 //! [`FailMode`]:
 //!
 //! * `Open` (default) — admit the RPC. Availability over strict
-//!   quota; matches the Phase 2 affinity-store behaviour. The
-//!   `redis_error_observer` is notified so operators can alert on a
-//!   sustained nonzero rate.
+//!   quota; matches the Redis affinity-store's fail-soft
+//!   behaviour. The `redis_error_observer` is notified so operators
+//!   can alert on a sustained nonzero rate.
 //! * `Closed` — reject the RPC. Use when a Redis outage must not
 //!   become a quota-bypass attack vector. Makes Redis a hard
 //!   dependency of every RPC.

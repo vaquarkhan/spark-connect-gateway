@@ -1,4 +1,4 @@
-//! Integration tests for Phase 3.1 tenant resolution: verifies that
+//! Integration tests for tenant resolution: verifies that
 //! the routing key seen by the affinity store carries the tenant
 //! the resolver produced, that resolver=Reject failure surfaces as
 //! Unauthenticated at the client, and that two tenants with the

@@ -1,25 +1,23 @@
 //! YAML configuration for the gateway.
 //!
-//! Two equivalent forms are accepted for backend discovery, to keep
-//! Phase 1 deployments unchanged while Phase 2 introduces dynamic
-//! sources:
+//! Two equivalent forms are accepted for backend discovery:
 //!
 //! ```yaml
-//! # Phase 1 shorthand (still valid):
+//! # Shorthand — equivalent to a static-list `backend_discovery`:
 //! backends:
 //!   - "host1:15002"
 //!   - "host2:15002"
 //! ```
 //!
 //! ```yaml
-//! # Tagged form (Phase 2):
+//! # Tagged static form:
 //! backend_discovery:
 //!   type: static
 //!   addresses: ["host1:15002", "host2:15002"]
 //! ```
 //!
 //! ```yaml
-//! # Tagged form (Phase 2, K8s):
+//! # Tagged K8s form — watches an Endpoints object:
 //! backend_discovery:
 //!   type: k8s
 //!   namespace: spark-connect
@@ -66,8 +64,9 @@ pub enum BackendDiscovery {
     },
 }
 
-/// Authentication configuration. Defaults to `none` so Phase 1 configs
-/// keep working unchanged.
+/// Authentication configuration. Defaults to `none` so an unset
+/// `auth:` block lets every caller through as `user_id="anonymous"`
+/// — fine for trusted in-cluster networks, not for external exposure.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -192,7 +191,7 @@ fn default_op_ttl_secs() -> u64 {
     15 * 60
 }
 
-/// Audit logging configuration (Phase 3.8). Records security- and
+/// Audit logging configuration. Records security- and
 /// compliance-relevant events as structured `tracing` events with
 /// `target = "scg::audit"`. On by default — the per-event cost is
 /// negligible and the compliance value is high.
@@ -225,7 +224,7 @@ impl Default for AuditSettings {
     }
 }
 
-/// Per-tenant rate-limit configuration (Phase 3.6). Token bucket
+/// Per-tenant rate-limit configuration. Token bucket
 /// per tenant with an optional per-user sub-bucket; both are
 /// disabled (`rpcs_per_second: 0`) by default so the limiter is a
 /// no-op until the operator opts in.
@@ -242,7 +241,8 @@ pub struct RateLimitSettings {
     /// Backend store for the bucket state. `memory` (default)
     /// enforces quotas per gateway replica; `redis` shares state
     /// across all replicas via a Lua-driven token bucket. See
-    /// Phase 3.7 docs for the trade-off.
+    /// `crates/ratelimit/src/redis.rs` for the wire format and the
+    /// trade-off between the two stores.
     #[serde(default)]
     pub store: RateLimitStore,
     /// Redis connection settings — only consulted when `store: redis`.
@@ -347,8 +347,8 @@ pub struct BucketSettings {
     pub per_user_burst: u64,
 }
 
-/// Per-tenant backend pool overrides (Phase 3). A multi-tenant
-/// deployment lists one entry per tenant that needs its own pool;
+/// Per-tenant backend pool overrides. A multi-tenant deployment
+/// lists one entry per tenant that needs its own pool;
 /// any tenant *not* listed here routes through the deployment's
 /// default pool (the existing `backends:` / `backend_discovery:`
 /// settings).
@@ -356,9 +356,9 @@ pub struct BucketSettings {
 /// The fallback `policy` decides what happens when an inbound RPC
 /// carries a tenant that has neither an explicit override nor (in
 /// the `Reject` case) any pool at all. Default `UseDefault` matches
-/// Phase 1/2 single-tenant deployments — everything routes to the
-/// default pool. `Reject` is the right choice for SaaS-style
-/// deployments where unconfigured tenants must not get any access.
+/// the single-tenant baseline — everything routes to the default
+/// pool. `Reject` is the right choice for SaaS-style deployments
+/// where unconfigured tenants must not get any access.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TenantPoolsSettings {
     /// Tenant name → its own pool's discovery configuration. The
@@ -392,9 +392,9 @@ fn default_unknown_tenant_policy() -> UnknownTenantPolicySetting {
 /// key, so two tenants with the same `session_id` get isolated
 /// affinity buckets.
 ///
-/// Phase 1/2 deployments without a `tenant_resolver:` block fall
-/// back to `from_claim + use_default + "default"`, which is the
-/// pre-Phase-3 behaviour (every RPC ends up in `tenant="default"`).
+/// Deployments without a `tenant_resolver:` block fall back to
+/// `from_claim + use_default + "default"`, so every RPC ends up
+/// in `tenant="default"` — the single-tenant baseline.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum TenantResolverSource {
@@ -408,8 +408,8 @@ pub enum TenantResolverSource {
         #[serde(default = "default_tenant_header")]
         header: String,
     },
-    /// Always use `default_name`. Single-tenant deployments running
-    /// Phase 3 code without bothering with auth claims or headers.
+    /// Always use `default_name`. Single-tenant deployments that
+    /// don't want to bother with auth claims or headers.
     AlwaysDefault,
 }
 
@@ -421,7 +421,8 @@ fn default_tenant_header() -> String {
 #[serde(rename_all = "snake_case")]
 pub enum TenantOnMissing {
     /// Fall back to `default_name` when the source yields nothing.
-    /// Back-compat default for Phase 1/2 upgrades.
+    /// The default — preserves single-tenant behaviour for
+    /// deployments that haven't opted into multi-tenant routing.
     UseDefault,
     /// Fail the RPC with `Unauthenticated`. Used by SaaS-style
     /// deployments where a missing tenant claim almost always means
@@ -624,12 +625,12 @@ pub struct Config {
     /// to the back-compat behaviour (every RPC -> tenant="default").
     pub tenant_resolver: TenantResolverSettings,
     /// Per-tenant backend pool overrides + unknown-tenant policy.
-    /// Empty `overrides` + `use_default` reproduces Phase 1/2
-    /// single-pool behaviour.
+    /// Empty `overrides` + `use_default` reproduces the single-pool
+    /// baseline.
     pub tenant_pools: TenantPoolsSettings,
-    /// Per-tenant rate limiting (Phase 3.6). Disabled by default.
+    /// Per-tenant rate limiting. Disabled by default.
     pub rate_limit: RateLimitSettings,
-    /// Structured audit logging (Phase 3.8). Enabled by default.
+    /// Structured audit logging. Enabled by default.
     pub audit: AuditSettings,
 }
 

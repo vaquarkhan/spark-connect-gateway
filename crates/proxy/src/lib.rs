@@ -1,6 +1,6 @@
 //! gRPC proxy for the Spark Connect service.
 //!
-//! Phase 1 design:
+//! Request flow:
 //!
 //! 1. Accept inbound `spark.connect.SparkConnectService` traffic via tonic.
 //! 2. For each RPC, derive a [`SessionKey`] (and an `operation_id` where
@@ -11,10 +11,10 @@
 //! 4. Open or reuse a tonic [`Channel`] to that backend (via [`Dialer`]),
 //!    forward the request, and pump any response stream back to the client.
 //!
-//! All twelve RPCs in the Spark Connect surface are forwarded; new RPCs
-//! added by upstream Spark will surface here as `Unimplemented` until they
-//! are wired in (no silent passthrough yet — Phase 4 may add a generic
-//! tower-level fallback).
+//! All RPCs in the Spark Connect surface are forwarded explicitly; new
+//! RPCs added by upstream Spark will surface here as `Unimplemented`
+//! until they are wired in. There is no generic tower-level
+//! passthrough.
 
 mod dial;
 mod handler;

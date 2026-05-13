@@ -53,11 +53,11 @@ struct MetricsInner {
 
     // Rate limit.
     rate_limit_rejected_total: IntCounterVec,
-    /// Redis-side errors observed by the distributed rate limiter
-    /// (Phase 3.7). Counts errors, not rejects — a fail-open
-    /// deployment increments this without firing
-    /// `rate_limit_rejected_total`. `reason` is one of a small fixed
-    /// set: `tenant_bucket`, `user_bucket`.
+    /// Redis-side errors observed by the distributed rate limiter.
+    /// Counts errors, not rejects — a fail-open deployment
+    /// increments this without firing `rate_limit_rejected_total`.
+    /// `reason` is one of a small fixed set: `tenant_bucket`,
+    /// `user_bucket`.
     rate_limit_redis_errors_total: IntCounterVec,
 }
 
@@ -111,7 +111,7 @@ impl Metrics {
         )?;
         let rate_limit_redis_errors_total = register_int_counter_vec_with_registry!(
             "scg_rate_limit_redis_errors_total",
-            "Backend errors from the Redis-backed rate limiter (Phase 3.7). Counts failures, not rejects.",
+            "Backend errors from the Redis-backed rate limiter. Counts failures, not rejects.",
             &["tenant", "reason"],
             registry,
         )?;

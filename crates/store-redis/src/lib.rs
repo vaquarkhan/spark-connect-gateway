@@ -1,9 +1,9 @@
 //! Redis-backed [`AffinityStore`] for cross-replica HA.
 //!
-//! Phase 1 ships [`scg-store-memory::MemoryStore`], which only works
-//! when the gateway runs as a single replica. When operators want to
-//! scale out (Helm chart with `replicas > 1` and `kind: Deployment`),
-//! the affinity table needs to live somewhere all replicas can see —
+//! The sibling [`scg-store-memory::MemoryStore`] only works when the
+//! gateway runs as a single replica. When operators want to scale
+//! out (Helm chart with `replicas > 1` and `kind: Deployment`), the
+//! affinity table needs to live somewhere all replicas can see —
 //! otherwise a Spark Connect session pinned to backend `B` by replica
 //! 1 will be re-pinned to a different backend by replica 2 the next
 //! time the client lands on it, breaking the
@@ -97,14 +97,6 @@ impl RedisStore {
 
     fn session_key(&self, k: &SessionKey) -> String {
         // {prefix}:s:{tenant}|{user_id}|{session_id}
-        //
-        // Note: Phase 2 deployments upgrading to Phase 3 will see
-        // their existing session bindings appear under a different
-        // key (the old format had no tenant segment). The old keys
-        // expire naturally via TTL; the impact is one round of
-        // re-pinning per active session. Rolling-restart with the
-        // old key_prefix would mix schemas — bump key_prefix during
-        // the upgrade if that matters.
         format!(
             "{}:s:{}|{}|{}",
             self.cfg.key_prefix, k.tenant, k.user_id, k.session_id

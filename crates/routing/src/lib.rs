@@ -6,9 +6,9 @@
 //!
 //! * `Pool` — *which* backend should serve a fresh session?
 //! * `AffinityStore` — *which* backend already serves an existing session?
-//! * `TenantRouter` — Phase 3: map a tenant string to its pool.
-//!   Single-tenant deployments still work — they configure exactly
-//!   one entry (often the implicit `"default"`).
+//! * `TenantRouter` — map a tenant string to its pool. Single-tenant
+//!   deployments still work — they configure exactly one entry
+//!   (often the implicit `"default"`).
 //! * `Router` — glue that asks the store first, then the pool from
 //!   `TenantRouter`, and remembers the decision.
 
@@ -18,10 +18,9 @@ use std::sync::Arc;
 use tonic::Status;
 
 /// Identifies a Spark Connect session within a tenant. The triple
-/// `(tenant, user_id, session_id)` is the affinity routing key. The
-/// `tenant` component was added in Phase 3 — pre-Phase-3 deployments
-/// implicitly use the literal string `"default"` (see
-/// [`SessionKey::new`]).
+/// `(tenant, user_id, session_id)` is the affinity routing key.
+/// Single-tenant deployments implicitly use the literal string
+/// `"default"` for the tenant component (see [`SessionKey::new`]).
 ///
 /// Spark Connect itself keys `SparkSession` only on `(user_id,
 /// session_id)`. Adding the tenant prefix lets multiple tenants share
@@ -42,9 +41,9 @@ pub struct SessionKey {
 
 impl SessionKey {
     /// Build a [`SessionKey`] without an explicit tenant — used by
-    /// pre-Phase-3 call sites (tests, single-tenant deployments).
-    /// The tenant is set to `"default"`, matching the back-compat
-    /// behaviour of `TenantResolverConfig::default()`.
+    /// tests and single-tenant call sites. The tenant is set to
+    /// `"default"`, matching the back-compat behaviour of
+    /// `TenantResolverConfig::default()`.
     pub fn new(user_id: impl Into<String>, session_id: impl Into<String>) -> Self {
         Self::with_tenant("default", user_id, session_id)
     }
@@ -71,10 +70,10 @@ impl SessionKey {
 
 /// Selects backends. Implementations must be safe for concurrent use.
 ///
-/// Phase 1 had a single static implementation that always returned a
-/// backend. Phase 2 introduces dynamic pools (K8s service-watch) where
-/// the pool can be empty during startup or after a flap, so `pick`
-/// returns `Option<String>`.
+/// Two shipping implementations: `scg-pool-static` (fixed list at
+/// startup) and `scg-pool-k8s` (Endpoints watch). The K8s pool can
+/// be empty during startup or after a flap, so `pick` returns
+/// `Option<String>`.
 pub trait Pool: Send + Sync + 'static {
     /// Pick the next backend for a *new* session, or `None` if no healthy
     /// backend is currently available. Must be safe for concurrent use;
@@ -87,19 +86,19 @@ pub trait Pool: Send + Sync + 'static {
 
     /// Best-effort hint that `addr` is unreachable. Implementations may
     /// remove `addr` from the rotation, decrement a health score, or
-    /// ignore the hint entirely. Phase 2 K8s pools use this for passive
-    /// failure detection alongside their active service-watch.
+    /// ignore the hint entirely. The K8s pool uses this for passive
+    /// failure detection alongside its active service-watch.
     fn mark_unhealthy(&self, _addr: &str) {}
 }
 
-/// Persistence layer for sticky routing decisions. Phase 1 ships an
-/// in-memory implementation; Phase 2 swaps in Redis (and optionally
-/// Postgres) so multiple gateway replicas share affinity.
+/// Persistence layer for sticky routing decisions. Two shipping
+/// backends: `scg-store-memory` (in-process, single-replica) and
+/// `scg-store-redis` (shared across replicas for HA).
 ///
-/// The trait is `async_trait` because Phase 2 backings (Redis,
-/// Postgres) are network calls. The in-memory Phase 1 impl wraps its
-/// sync work in async fn signatures with no `await` points, so
-/// callers pay only the trait-object dispatch cost.
+/// The trait is `async_trait` because the Redis backing is a
+/// network call. The in-memory impl wraps its sync work in async-fn
+/// signatures with no `await` points, so callers pay only the
+/// trait-object dispatch cost.
 #[async_trait::async_trait]
 pub trait AffinityStore: Send + Sync + 'static {
     async fn lookup_session(&self, key: &SessionKey) -> Option<String>;
@@ -260,7 +259,7 @@ impl Router {
 
     /// Same as [`resolve_session`] but distinguishes a freshly-bound
     /// session from an existing one — useful for audit logging
-    /// (Phase 3.8 emits `session.create` only on the freshly-bound
+    /// (`session.create` events fire only on the freshly-bound
     /// path). Most callers should use `resolve_session` and ignore
     /// the binding flavour.
     pub async fn resolve_session_detailed(

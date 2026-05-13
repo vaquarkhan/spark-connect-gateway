@@ -91,14 +91,14 @@ async fn main() -> Result<()> {
     let addr = parse_bind_addr(&cfg.bind_addr)?;
     log_startup(&cfg, &addr);
 
-    // Two-phase shutdown:
+    // Two-step shutdown:
     //   1. SIGTERM arrives → flip /readyz to 503 (K8s drains us from
     //      the Service), wait for active streams to finish or for the
     //      drain deadline.
     //   2. Trigger the gRPC + admin server shutdown.
     //
-    // The two phases are coordinated by `drain_tx` (phase 1 → 2) and
-    // `shutdown_tx` (phase 2 → both servers).
+    // The two steps are coordinated by `drain_tx` (step 1 → 2) and
+    // `shutdown_tx` (step 2 → both servers).
     let (drain_tx, mut drain_rx) = watch::channel(false);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let readiness_for_drain = readiness.clone();
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
             deadline_secs = shutdown_deadline.as_secs(),
             "shutdown: SIGTERM/SIGINT received; entering drain"
         );
-        // Phase 1: tell K8s we're not ready so new traffic stops flowing.
+        // Step 1: tell K8s we're not ready so new traffic stops flowing.
         readiness_for_drain.mark_not_ready();
         let _ = drain_tx.send(true);
         // Wait for in-flight streams to drain or the deadline to expire.
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                 "shutdown: drain deadline reached; forcing shutdown"
             ),
         }
-        // Phase 2: stop the servers.
+        // Step 2: stop the servers.
         let _ = shutdown_tx.send(true);
     });
     // The drain_rx is parked here to keep the channel alive; the drain
@@ -234,8 +234,8 @@ async fn build_pool_from_discovery(
 /// Pool selection per tenant:
 ///
 /// * The deployment's *default* pool comes from `cfg.discovery`
-///   (the existing `backends:` / `backend_discovery:` config —
-///   back-compat with Phase 1/2 deployments).
+///   (the `backends:` / `backend_discovery:` config — also the
+///   single-pool baseline for non-multi-tenant deployments).
 /// * Each entry in `cfg.tenant_pools.overrides` becomes a separate
 ///   tenant-scoped pool, optionally wrapped in `HealthAwarePool`
 ///   when active health probing is enabled.
@@ -251,8 +251,9 @@ async fn build_pool_from_discovery(
 ///
 /// `metrics.set_backend_pool_size` is set to the *default* pool's
 /// size only — per-tenant gauges would need a `tenant` label and
-/// we explicitly bounded cardinality on `scg_backend_pool_size` in
-/// Phase 2.12. Per-tenant pool sizes show up in logs instead.
+/// we deliberately keep `scg_backend_pool_size` unlabelled to
+/// bound cardinality. Per-tenant pool sizes show up in logs
+/// instead.
 async fn build_tenant_routing(
     cfg: &Config,
     metrics: &Metrics,
@@ -455,8 +456,8 @@ fn build_audit_logger(cfg: &AuditSettings) -> AuditLogger {
 /// [`TenantResolver`]. The tagged `source` enum maps to the
 /// equivalent `scg-tenant` variant. With no `tenant_resolver:`
 /// block in config the gateway gets the back-compat default — every
-/// inbound RPC ends up in `tenant="default"`, preserving Phase 1/2
-/// single-tenant behaviour.
+/// inbound RPC ends up in `tenant="default"`, preserving the
+/// single-tenant baseline.
 fn build_tenant_resolver(cfg: &TenantResolverSettings) -> TenantResolver {
     let source = match &cfg.source {
         TenantResolverSource::FromClaim => TenantSource::FromClaim,

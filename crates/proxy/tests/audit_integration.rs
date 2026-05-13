@@ -1,4 +1,4 @@
-//! Integration test for Phase 3.8 audit logging.
+//! Integration test for structured audit logging.
 //!
 //! Drives RPCs through a real gRPC server with an enabled
 //! [`AuditLogger`] and asserts the four default event types fire

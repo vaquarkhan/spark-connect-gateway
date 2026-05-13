@@ -1,7 +1,7 @@
-//! Phase 3.9: multi-tenant end-to-end integration test.
+//! Multi-tenant end-to-end integration test.
 //!
 //! One gateway, two tenants (`team-a`, `team-b`), three backends
-//! (`be-a`, `be-b`, `be-default`), and the full Phase 3 stack wired
+//! (`be-a`, `be-b`, `be-default`), and the full multi-tenant stack wired
 //! together: static-token auth (with per-token tenant claim) →
 //! tenant resolver (`FromClaim`) → tenant-routed pools → per-tenant
 //! rate limiter → session affinity → audit log.
@@ -266,9 +266,10 @@ struct Rig {
 
 /// Build the multi-tenant rig used by all tests in this file.
 ///
-/// `unknown_policy` lets the caller swap between `UseDefault` (the
-/// permissive Phase 1/2 back-compat) and `Reject` (strict SaaS-style
-/// isolation). The auth-level test wants the strict policy.
+/// `unknown_policy` lets the caller swap between `UseDefault`
+/// (permissive single-tenant fall-through) and `Reject` (strict
+/// SaaS-style isolation). The auth-level test wants the strict
+/// policy.
 async fn spawn_rig(unknown_policy: UnknownTenantPolicy) -> Rig {
     let (be_a, ka) = spawn_backend("be-a").await;
     let (be_b, kb) = spawn_backend("be-b").await;

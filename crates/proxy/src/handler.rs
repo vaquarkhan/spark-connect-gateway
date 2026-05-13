@@ -64,7 +64,7 @@ impl SparkConnectProxy {
     /// Build a proxy with auth disabled, a fresh throwaway
     /// `Metrics`, and the default (back-compat) tenant resolver
     /// (every RPC ends up in `tenant="default"`). Used by tests and
-    /// Phase 1-style deployments.
+    /// minimal single-tenant deployments.
     ///
     /// Production deployments use [`SparkConnectProxy::builder`] (or
     /// the older [`with_auth_and_metrics`]) and hand in a `Metrics`
@@ -284,9 +284,9 @@ fn stamp_user_context(uc: &mut Option<pb::UserContext>, id: &Identity) {
 }
 
 /// Convert a possibly-empty backend selection into an `Unavailable` Status.
-/// A None is most commonly produced when a dynamic pool (Phase 2 K8s
-/// service-watch) hasn't seen any healthy endpoint yet, e.g. during
-/// gateway boot before the watcher's initial list event.
+/// A None is most commonly produced when a dynamic pool (the K8s
+/// Endpoints watcher) hasn't seen any healthy endpoint yet, e.g.
+/// during gateway boot before the watcher's initial list event.
 fn require_addr(addr: Result<Option<String>, Status>) -> Result<String, Status> {
     // Two failure modes:
     // * `Err(Status)` — the tenant has no configured pool and the

@@ -1,4 +1,4 @@
-//! Tenant resolution for Phase 3 multi-tenant routing.
+//! Tenant resolution for multi-tenant routing.
 //!
 //! The gateway's routing key is `(tenant, user_id, session_id)`. The
 //! tenant comes from one of three sources depending on deployment:
@@ -7,13 +7,13 @@
 //!   (most common — JWT/OIDC carry a tenant claim).
 //! * From an explicit gRPC metadata header (auth disabled but the
 //!   client self-declares which tenant it speaks for).
-//! * Fixed for the whole deployment (single-tenant config using
-//!   Phase 3 code).
+//! * Fixed for the whole deployment (single-tenant deployments).
 //!
 //! Two policies on what to do when the source doesn't yield a tenant:
 //!
-//! * `UseDefault` — fall back to a configured name. Back-compat-safe
-//!   for Phase 1/2 users who upgrade without enabling multi-tenant.
+//! * `UseDefault` — fall back to a configured name. Preserves
+//!   single-tenant behaviour when the operator hasn't opted into
+//!   multi-tenant routing.
 //! * `Reject` — return `Unauthenticated` to the client. The right
 //!   choice for SaaS-style deployments where a missing tenant claim
 //!   is almost always an IdP misconfiguration.
@@ -34,17 +34,18 @@ pub enum TenantSource {
     /// Read from a gRPC metadata header. Used when auth is disabled
     /// but the client cooperates by declaring a tenant.
     FromMetadata { header: String },
-    /// Always use the configured `default_name`. Used by single-tenant
-    /// deployments running Phase 3 code without bothering with auth
-    /// claims or headers.
+    /// Always use the configured `default_name`. Single-tenant
+    /// deployments that don't want to bother with auth claims or
+    /// metadata headers.
     AlwaysDefault,
 }
 
 /// What to do when the configured source returns nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnMissing {
-    /// Fall back to the configured `default_name`. Back-compat with
-    /// Phase 1/2 deployments where `tenant` is conceptually absent.
+    /// Fall back to the configured `default_name`. Preserves
+    /// single-tenant behaviour when the auth claim / metadata header
+    /// is absent.
     UseDefault,
     /// Fail the RPC with `Unauthenticated`. Used by deployments that
     /// require every caller to identify a tenant; a missing tenant
@@ -63,11 +64,11 @@ pub struct TenantResolverConfig {
 }
 
 impl Default for TenantResolverConfig {
-    /// Back-compat default for Phase 1/2 deployments: read tenant
-    /// from the auth claim if present, fall back to `"default"` if
-    /// not. A gateway that just upgraded to Phase 3 code without
-    /// touching its config keeps single-tenant behaviour — every
-    /// inbound RPC ends up in `tenant="default"`.
+    /// Single-tenant baseline: read tenant from the auth claim if
+    /// present, fall back to `"default"` otherwise. A deployment
+    /// that doesn't configure a `tenant_resolver:` block keeps
+    /// single-tenant behaviour — every inbound RPC ends up in
+    /// `tenant="default"`.
     fn default() -> Self {
         Self {
             source: TenantSource::FromClaim,

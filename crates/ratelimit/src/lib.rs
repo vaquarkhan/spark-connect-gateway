@@ -2,12 +2,12 @@
 //!
 //! Two backends:
 //!
-//! * **In-memory** (Phase 3.6) — fine for single-replica
-//!   deployments or multi-replica setups behind a sticky LB. Each
-//!   gateway replica enforces its own bucket; effective quota is
+//! * **In-memory** — fine for single-replica deployments or
+//!   multi-replica setups behind a sticky LB. Each gateway replica
+//!   enforces its own bucket; effective quota is
 //!   `N × configured_rate` for an N-replica deployment.
-//! * **Redis** (Phase 3.7) — atomic token bucket via a Lua script,
-//!   shared across all gateway replicas. The quota is enforced
+//! * **Redis** — atomic token bucket via a Lua script, shared
+//!   across all gateway replicas. The quota is enforced
 //!   cluster-wide. See [`redis`] for the wire format and the Lua
 //!   contract.
 //!
@@ -181,9 +181,9 @@ impl RedisErrorObserver for NoopRedisErrorObserver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailMode {
     /// Admit the RPC. Recommended default — availability over
-    /// strict-quota enforcement, mirrors the Phase 2 affinity-store
-    /// behaviour. The error metric still fires so operators can see
-    /// the outage in real time.
+    /// strict-quota enforcement, mirrors the Redis affinity-store's
+    /// fail-soft behaviour. The error metric still fires so
+    /// operators can see the outage in real time.
     Open,
     /// Reject the RPC with `ResourceExhausted`. Pick this for
     /// strict-SaaS isolation policies where a Redis outage must not
@@ -211,7 +211,7 @@ pub enum RateLimiter {
 }
 
 impl RateLimiter {
-    /// Convenience: build the in-memory limiter (Phase 3.6 path).
+    /// Convenience: build the in-memory limiter.
     pub fn new(
         default: TenantLimits,
         overrides: HashMap<String, TenantLimits>,

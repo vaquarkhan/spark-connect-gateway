@@ -1,4 +1,4 @@
-//! Load-test harness (Phase 2.19).
+//! Load-test harness.
 //!
 //! Spins up a SparkConnectProxy + N FakeBackends in-process and
 //! drives traffic at it through real gRPC clients. Measures

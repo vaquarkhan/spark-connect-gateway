@@ -1,4 +1,4 @@
-//! Integration test for Phase 3.6 per-tenant rate limiting.
+//! Integration test for per-tenant rate limiting.
 //!
 //! Drives RPCs through a real gRPC server with the rate limiter
 //! enabled and asserts:

@@ -1,6 +1,6 @@
-//! Graceful-shutdown smoke test (Phase 2.15).
+//! Graceful-shutdown smoke test.
 //!
-//! Exercises the two-phase drain logic the gateway main does on
+//! Exercises the two-step drain logic the gateway main does on
 //! SIGTERM, but in-process (no actual signals — drain is triggered
 //! by sending on a channel the same way `shutdown_signal()` does in
 //! production).
