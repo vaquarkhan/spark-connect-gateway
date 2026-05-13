@@ -1,5 +1,6 @@
-//! Backend pool whose membership is fixed at startup. Phase 1 only —
-//! Phase 2 introduces dynamic K8s service-watch and Consul-backed pools.
+//! Backend pool whose membership is fixed at startup. Pairs with
+//! `scg-pool-k8s` for the dynamic K8s-Endpoints-watch variant; both
+//! implement the same `Pool` trait and can be swapped via config.
 
 use scg_routing::Pool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,8 +49,9 @@ impl Pool for StaticPool {
 
     fn all_healthy(&self) -> Vec<String> {
         // Static pools have no notion of health — every configured
-        // backend is presumed healthy. Phase 2 will add active health
-        // checks; until then a failed forward surfaces as an error to
+        // backend is presumed healthy. Wrap with `scg-healthcheck`'s
+        // `HealthAwarePool` to add active gRPC health probing; on a
+        // bare StaticPool a failed forward surfaces as an error to
         // the client and the next session round-robins onward.
         self.backends.clone()
     }

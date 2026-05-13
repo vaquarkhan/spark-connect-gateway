@@ -232,6 +232,7 @@ impl SparkConnectProxy {
                     rid,
                     &key.tenant,
                     &identity.user_id,
+                    &identity.groups,
                     &key.session_id,
                     &o.addr,
                 );
@@ -634,6 +635,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
                 &rid,
                 &key.tenant,
                 &identity.user_id,
+                &identity.groups,
                 &key.session_id,
                 &addr,
             );

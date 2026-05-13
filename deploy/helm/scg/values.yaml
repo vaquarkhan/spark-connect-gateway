@@ -77,6 +77,12 @@ backendDiscovery:
 
 # Authentication mode. Defaults to anonymous (no auth) — fine for a
 # trusted in-cluster network, NOT for production exposure.
+#
+# `groups` (on static tokens) and `groupsClaim` (on JWT/OIDC) are
+# recorded on `session.create` / `session.release` audit events so
+# operators can see which memberships each identity carries. They
+# do NOT currently gate any RPC — the gateway has no authorization
+# layer beyond authentication + tenant resolution.
 auth:
   # one of: none | static | jwt | oidc
   type: none

@@ -1,8 +1,7 @@
-//! Phase-1 in-process affinity store.
-//!
-//! Phase 2 replaces this with Redis or Postgres for cross-replica HA. The
-//! `AffinityStore` trait is kept narrow specifically so swapping the backing
-//! store does not ripple into the proxy layer.
+//! In-process `AffinityStore` for single-replica deployments and
+//! tests. For multi-replica HA use `scg-store-redis` — the
+//! `AffinityStore` trait is kept narrow specifically so swapping
+//! the backing store does not ripple into the proxy layer.
 
 use parking_lot::RwLock;
 use scg_routing::{AffinityStore, SessionKey};

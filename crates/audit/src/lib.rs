@@ -91,11 +91,19 @@ impl AuditLogger {
     /// `session.create` — a `(tenant, user, session_id)` was bound
     /// to `backend` for the first time. Fires on the binding-path
     /// of the affinity store (not on every lookup).
+    ///
+    /// `groups` is the verified identity's group membership (from
+    /// the JWT/OIDC `groups` claim or the static-token config).
+    /// Recorded as a comma-joined string so the audit stream stays
+    /// flat JSON; downstream tooling can split if it needs an array.
+    /// Per-RPC events deliberately *don't* carry groups — they fire
+    /// frequently enough that doubling the field count matters.
     pub fn session_create(
         &self,
         rid: &str,
         tenant: &str,
         user_id: &str,
+        groups: &[String],
         session_id: &str,
         backend: &str,
     ) {
@@ -108,6 +116,7 @@ impl AuditLogger {
             rid = %rid,
             tenant = %tenant,
             user_id = %user_id,
+            groups = %groups.join(","),
             session_id = %session_id,
             backend = %backend,
             "session created",
@@ -122,6 +131,7 @@ impl AuditLogger {
         rid: &str,
         tenant: &str,
         user_id: &str,
+        groups: &[String],
         session_id: &str,
         backend: &str,
     ) {
@@ -134,6 +144,7 @@ impl AuditLogger {
             rid = %rid,
             tenant = %tenant,
             user_id = %user_id,
+            groups = %groups.join(","),
             session_id = %session_id,
             backend = %backend,
             "session released",
@@ -266,7 +277,7 @@ mod tests {
     fn disabled_logger_emits_nothing() {
         with_capture(|cap| {
             let a = AuditLogger::disabled();
-            a.session_create("rid-1", "t", "u", "s", "b:1");
+            a.session_create("rid-1", "t", "u", &[], "s", "b:1");
             a.auth_failure("rid-2", "Config", "missing_token");
             a.rpc_error("rid-3", "Config", "t", "u", "Internal", "boom");
             assert!(cap.events.lock().is_empty());
@@ -277,7 +288,14 @@ mod tests {
     fn session_create_emits_expected_fields() {
         with_capture(|cap| {
             let a = AuditLogger::new(AuditConfig::default());
-            a.session_create("rid-1", "team-a", "alice", "sess-1", "be:15002");
+            a.session_create(
+                "rid-1",
+                "team-a",
+                "alice",
+                &["devs".into(), "admins".into()],
+                "sess-1",
+                "be:15002",
+            );
             let events = cap.events.lock();
             assert_eq!(events.len(), 1);
             let e = &events[0];
@@ -296,6 +314,21 @@ mod tests {
                 e.fields.get("backend").map(|s| s.as_str()),
                 Some("be:15002")
             );
+            assert_eq!(
+                e.fields.get("groups").map(|s| s.as_str()),
+                Some("devs,admins"),
+            );
+        });
+    }
+
+    #[test]
+    fn session_create_empty_groups_renders_empty_string() {
+        with_capture(|cap| {
+            let a = AuditLogger::new(AuditConfig::default());
+            a.session_create("rid-1", "team-a", "alice", &[], "sess-1", "be:15002");
+            let events = cap.events.lock();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].fields.get("groups").map(|s| s.as_str()), Some(""));
         });
     }
 

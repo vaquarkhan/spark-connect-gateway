@@ -31,7 +31,10 @@ pub struct TokenEntry {
     /// Optional tenant (workspace / org / project).
     #[serde(default)]
     pub tenant: Option<String>,
-    /// Optional groups (reserved for Phase 3 RBAC).
+    /// Optional groups. Recorded on `session.create` /
+    /// `session.release` audit events so operators can see which
+    /// memberships an identity carries; not currently consulted for
+    /// authorization (the gateway has no RBAC layer yet).
     #[serde(default)]
     pub groups: Vec<String>,
 }

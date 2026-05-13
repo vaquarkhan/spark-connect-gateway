@@ -323,6 +323,43 @@ async fn session_create_fires_once_per_binding() {
         first.fields.get("session_id").map(|s| s.as_str()),
         Some("sess-1")
     );
+    // Anonymous auth → empty groups. The field still appears (as ""),
+    // so consumers can rely on its presence regardless of auth shape.
+    assert_eq!(first.fields.get("groups").map(|s| s.as_str()), Some(""));
+}
+
+#[tokio::test]
+async fn session_create_carries_groups_from_token() {
+    // Static-token auth with a token that declares groups. The audit
+    // event must carry them so operators querying the audit stream
+    // can see who has which memberships.
+    let (cap, _guard) = install_capture();
+    let auth_inner = StaticTokenAuthenticator::new(vec![TokenEntry {
+        token: "dev-token".into(),
+        user_id: "alice".into(),
+        tenant: None,
+        groups: vec!["devs".into(), "admins".into()],
+    }])
+    .unwrap();
+    let auth = AuthInterceptor::new(Arc::new(auth_inner));
+    let rig = spawn_rig(auth).await;
+    let mut c =
+        pb::spark_connect_service_client::SparkConnectServiceClient::new(rig.channel.clone());
+
+    let mut req = config_request("sess-grp", "default");
+    req.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from("Bearer dev-token").unwrap(),
+    );
+    c.config(req).await.unwrap();
+
+    let events = cap.snapshot();
+    let evt = find_event(&events, "session.create").unwrap();
+    assert_eq!(evt.fields.get("user_id").map(|s| s.as_str()), Some("alice"));
+    assert_eq!(
+        evt.fields.get("groups").map(|s| s.as_str()),
+        Some("devs,admins"),
+    );
 }
 
 #[tokio::test]

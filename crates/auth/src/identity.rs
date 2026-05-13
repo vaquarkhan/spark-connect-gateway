@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 /// What the gateway *knows* about the caller after auth has succeeded.
 ///
-/// Phase 2 only uses `user_id` for routing-key construction; `tenant`
-/// and `groups` are populated when present so Phase 3 work
-/// (multi-tenant routing, RBAC) can pick them up without changing the
-/// trait surface.
+/// `user_id` drives session-affinity routing-key construction and
+/// gets injected into the forwarded `UserContext.user_id`. `tenant`
+/// is consumed by the tenant resolver, per-tenant pool router, and
+/// rate limiter. `groups` is recorded on session-lifecycle audit
+/// events; the gateway has no RBAC layer yet, so groups are
+/// informational at the data plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// Stable user identifier. Whatever the authenticator declares this
@@ -17,7 +19,7 @@ pub struct Identity {
     /// Optional tenant identifier (workspace, org, project, …).
     pub tenant: Option<String>,
     /// Optional group memberships (LDAP groups, JWT `groups` claim,
-    /// custom claim). Reserved for Phase 3 RBAC.
+    /// custom claim).
     pub groups: Vec<String>,
 }
 

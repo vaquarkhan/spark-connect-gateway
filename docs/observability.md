@@ -266,11 +266,19 @@ Five event types, controlled by `audit.enabled` (default `true`) and
 
 Every audit event carries `rid` (correlation ID) plus the fields
 relevant to the event (`tenant`, `user_id`, `session_id`, `backend`,
-`rpc`, `code`, `message`, …). Successful RPCs are intentionally *not*
-logged by default because `scg_rpcs_total{code="OK"}` already counts
-them and filling the audit stream with every Config call defeats the
-purpose. Flip `logSuccessfulRpcs: true` only when the deployment is
-subject to a strict-monitoring policy that requires per-call audit.
+`rpc`, `code`, `message`, …). `session.create` and `session.release`
+additionally carry `groups` — a comma-joined string of the identity's
+group memberships from the auth backend's `groups` / `groupsClaim`
+config. Empty when the authenticator doesn't surface groups
+(anonymous, token without `groups`, JWT without a `groupsClaim`).
+Per-RPC events (`rpc.error`, `rpc.ok`) deliberately omit `groups` —
+they fire frequently enough that doubling the field count matters.
+
+Successful RPCs are intentionally *not* logged by default because
+`scg_rpcs_total{code="OK"}` already counts them and filling the
+audit stream with every Config call defeats the purpose. Flip
+`logSuccessfulRpcs: true` only when the deployment is subject to a
+strict-monitoring policy that requires per-call audit.
 
 ### Routing audit events to a dedicated stream
 
