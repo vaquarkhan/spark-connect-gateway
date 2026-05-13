@@ -150,11 +150,11 @@ fn default_refresh_floor_secs() -> u64 {
 }
 
 /// Where the gateway keeps its `(user_id, session_id) -> backend`
-/// affinity table. Default `memory` keeps the Phase-1 in-process
-/// behaviour. `redis` is required for HA across multiple gateway
-/// replicas — without it, two replicas will pin the same session to
-/// different backends and Spark Connect's per-driver session state
-/// stops being consistent.
+/// affinity table. Default `memory` is single-replica only.
+/// `redis` is required for HA across multiple gateway replicas —
+/// without it, two replicas will pin the same session to different
+/// backends and Spark Connect's per-driver session state stops
+/// being consistent.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AffinityStoreConfig {
@@ -465,9 +465,9 @@ impl Default for TenantResolverSettings {
 /// Health service.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthCheckSettings {
-    /// Master switch. `false` (default) keeps the Phase-1 passive
-    /// behaviour: routing fails through to the next session on a
-    /// forward error.
+    /// Master switch. `false` (default) skips active probing —
+    /// routing fails through to the next session on a forward
+    /// error instead.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_hc_interval_secs")]
@@ -532,7 +532,7 @@ fn default_shutdown_deadline_secs() -> u64 {
     30
 }
 
-/// Distributed-tracing configuration. Off by default — Phase-1 configs
+/// Distributed-tracing configuration. Off by default — configs
 /// without a `tracing:` section keep working.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TracingSettings {

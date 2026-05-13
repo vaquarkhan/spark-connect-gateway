@@ -14,7 +14,7 @@ being installed in the cluster — see its README for installation.
 - `service.yaml` — a single `ClusterIP` service that fronts both instances by
   label selector. The gateway can be configured to either:
   - point its static backend list at each instance's pod IP / per-instance
-    Service (recommended for Phase 1, so stickiness is observable), or
+    Service (recommended, so stickiness is observable), or
   - point a single entry at this Service (acceptable, but kube-proxy will
     pick a pod per TCP connection — fine for unary RPCs, but Spark Connect
     streams must always land on the same pod for the lifetime of a session).

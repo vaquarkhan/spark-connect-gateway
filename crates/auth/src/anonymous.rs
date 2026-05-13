@@ -1,7 +1,8 @@
 //! `AnonymousAuthenticator` — used when auth is explicitly disabled.
 //!
-//! Returns a fixed `Identity { user_id: "anonymous", … }`. This is the
-//! Phase-1-equivalent behaviour: the gateway accepts every request.
+//! Returns a fixed `Identity { user_id: "anonymous", … }`: the
+//! gateway accepts every request without authentication. Fine for
+//! trusted in-cluster networks, never for external exposure.
 
 use async_trait::async_trait;
 use tonic::metadata::MetadataMap;

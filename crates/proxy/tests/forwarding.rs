@@ -2,7 +2,7 @@
 //! Spark Connect backends. Validates forwarding semantics without needing a
 //! real Spark distribution.
 //!
-//! The four scenarios mirror the Go phase-1 tests:
+//! Four scenarios:
 //!
 //! 1. Unary RPC forwarding (`Config`).
 //! 2. Server-streaming forwarding emits all upstream messages (`ExecutePlan`).

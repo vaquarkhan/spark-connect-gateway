@@ -129,8 +129,8 @@ The full reference (with defaults) is in [`values.yaml`](values.yaml)
 
 ## Verifying multi-replica HA
 
-After install, you can drive the Phase-2.18 HA smoke test against
-the deployed cluster — see `crates/proxy/examples/ha_smoke.rs` in the
+After install, you can drive the HA smoke test against the
+deployed cluster — see `crates/proxy/examples/ha_smoke.rs` in the
 parent repo. With `kubectl port-forward` and a `REDIS_URL` pointing
 at the bundled Redis, the same harness validates the three
 invariants (shared state, failover after replica death, op-id

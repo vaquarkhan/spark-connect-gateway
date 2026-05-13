@@ -30,4 +30,4 @@ maintainers:
 annotations:
   artifacthub.io/changes: |
     - kind: added
-      description: "Initial Helm chart (Phase 2.17)."
+      description: "Initial Helm chart."

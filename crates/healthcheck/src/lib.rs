@@ -1,6 +1,6 @@
 //! Active gRPC health probing wrapped around a [`Pool`].
 //!
-//! The Phase-1 [`scg_routing::Pool`] trait is purely round-robin: it
+//! The base [`scg_routing::Pool`] trait is purely round-robin: it
 //! hands out backends without knowing whether they actually answer.
 //! A backend pod that has wedged but not crashed (process alive,
 //! gRPC server not responding) will keep getting traffic until K8s

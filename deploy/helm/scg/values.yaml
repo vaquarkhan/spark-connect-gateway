@@ -161,7 +161,7 @@ redis:
     accessModes:
       - ReadWriteOnce
 
-# Per-tenant rate limiting (Phase 3.6). Token-bucket per tenant
+# Per-tenant rate limiting. Token-bucket per tenant
 # (and optionally per-user inside a tenant). Off by default — every
 # RPC is admitted. Turn on `enabled` and set `default.rpcsPerSecond`
 # + `default.burst` to apply a uniform limit; add entries under
@@ -213,7 +213,7 @@ rateLimit:
     perUserBurst: 0
   overrides: {}
 
-# Per-tenant backend pool overrides (Phase 3.2). The `backendDiscovery`
+# Per-tenant backend pool overrides. The `backendDiscovery`
 # above is the *default* pool — used for the `default` tenant and for
 # any tenant not explicitly listed below. Add an entry under
 # `tenantPools.overrides` to give a specific tenant its own pool with
@@ -244,12 +244,12 @@ tenantPools:
 # to. The resolved tenant becomes the first segment of the routing
 # key, so two tenants with the same session_id stay isolated.
 #
-# Defaults give back-compat (every RPC → tenant="default"), matching
-# Phase 1/2 single-tenant behaviour. Switch `source` to from_metadata
-# when auth is disabled but clients self-declare a tenant via a gRPC
-# header; switch to always_default for a single-tenant deployment
-# running Phase 3 code; switch `on_missing: reject` for SaaS-style
-# strict isolation where a missing tenant claim is a misconfiguration.
+# Defaults route every RPC to tenant="default" — the single-tenant
+# baseline. Switch `source` to from_metadata when auth is disabled
+# but clients self-declare a tenant via a gRPC header; switch to
+# always_default to skip the tenant lookup entirely; switch
+# `on_missing: reject` for SaaS-style strict isolation where a
+# missing tenant claim is a misconfiguration.
 tenantResolver:
   # one of: from_claim | from_metadata | always_default
   source: from_claim

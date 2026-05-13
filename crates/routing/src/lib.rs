@@ -229,8 +229,9 @@ impl Router {
         Self { tenants, store }
     }
 
-    /// Single-pool convenience constructor matching the pre-Phase-3
-    /// API. Equivalent to `Router::new(TenantRouter::single(pool), store)`.
+    /// Single-pool convenience constructor for single-tenant
+    /// deployments. Equivalent to
+    /// `Router::new(TenantRouter::single(pool), store)`.
     pub fn single_pool(pool: Arc<dyn Pool>, store: Arc<dyn AffinityStore>) -> Self {
         Self::new(TenantRouter::single(pool), store)
     }
