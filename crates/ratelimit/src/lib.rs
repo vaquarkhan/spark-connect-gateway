@@ -1,9 +1,15 @@
 //! Per-tenant (+ optional per-user) token-bucket rate limiting.
 //!
-//! Phase 3.6. In-memory only — fine for single-replica deployments
-//! or multi-replica setups behind a sticky LB. Phase 3.7 swaps in a
-//! Redis-backed store for distributed rate limiting across
-//! replicas.
+//! Two backends:
+//!
+//! * **In-memory** (Phase 3.6) — fine for single-replica
+//!   deployments or multi-replica setups behind a sticky LB. Each
+//!   gateway replica enforces its own bucket; effective quota is
+//!   `N × configured_rate` for an N-replica deployment.
+//! * **Redis** (Phase 3.7) — atomic token bucket via a Lua script,
+//!   shared across all gateway replicas. The quota is enforced
+//!   cluster-wide. See [`redis`] for the wire format and the Lua
+//!   contract.
 //!
 //! ## Why token bucket
 //!
@@ -157,16 +163,96 @@ impl Bucket {
     }
 }
 
-/// In-memory rate limiter. Cheap to clone (everything's behind an
-/// `Arc`). Operator-supplied config is fixed for the lifetime of
-/// the process; Phase 3.7 will add a Redis-backed equivalent for
-/// multi-replica deployments.
-#[derive(Clone)]
-pub struct RateLimiter {
-    inner: Arc<RateLimiterInner>,
+/// Cluster-wide observer hook for Redis-related errors. Fail-open
+/// deployments use this to bump `scg_rate_limit_redis_errors_total`
+/// — fail-closed deployments still bump it before returning
+/// `ResourceExhausted`.
+pub trait RedisErrorObserver: Send + Sync + 'static {
+    fn on_redis_error(&self, tenant: &str, reason: &'static str);
 }
 
-struct RateLimiterInner {
+/// No-op variant used when redis errors aren't being counted.
+pub struct NoopRedisErrorObserver;
+impl RedisErrorObserver for NoopRedisErrorObserver {
+    fn on_redis_error(&self, _: &str, _: &'static str) {}
+}
+
+/// Behaviour when the Redis backend is unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailMode {
+    /// Admit the RPC. Recommended default — availability over
+    /// strict-quota enforcement, mirrors the Phase 2 affinity-store
+    /// behaviour. The error metric still fires so operators can see
+    /// the outage in real time.
+    Open,
+    /// Reject the RPC with `ResourceExhausted`. Pick this for
+    /// strict-SaaS isolation policies where a Redis outage must not
+    /// become a quota-bypass attack vector. Note: this makes Redis
+    /// a hard dependency of the request path.
+    Closed,
+}
+
+impl FailMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailMode::Open => "open",
+            FailMode::Closed => "closed",
+        }
+    }
+}
+
+/// Public rate-limiter handle — an enum so the same proxy call site
+/// works for both backends. Cheap to clone (each variant is behind
+/// `Arc`).
+#[derive(Clone)]
+pub enum RateLimiter {
+    Memory(MemoryLimiter),
+    Redis(redis::RedisLimiter),
+}
+
+impl RateLimiter {
+    /// Convenience: build the in-memory limiter (Phase 3.6 path).
+    pub fn new(
+        default: TenantLimits,
+        overrides: HashMap<String, TenantLimits>,
+        observer: Arc<dyn LimiterObserver>,
+    ) -> Self {
+        Self::Memory(MemoryLimiter::new(default, overrides, observer))
+    }
+
+    /// True when *some* bucket is enabled — caller can skip the
+    /// check-and-acquire dance when it's not.
+    pub fn is_active(&self) -> bool {
+        match self {
+            Self::Memory(m) => m.is_active(),
+            Self::Redis(r) => r.is_active(),
+        }
+    }
+
+    /// Take one token from the (tenant, user) bucket pair. Returns
+    /// `Ok(())` when both buckets had tokens available, or
+    /// `Err(Status::ResourceExhausted)` when either was empty.
+    ///
+    /// On rejection the observer is notified with the *first* scope
+    /// that failed — typically the more-restrictive of the two —
+    /// so metrics show which dimension is the bottleneck.
+    pub async fn check(&self, tenant: &str, user: &str) -> Result<(), Status> {
+        match self {
+            Self::Memory(m) => m.check(tenant, user),
+            Self::Redis(r) => r.check(tenant, user).await,
+        }
+    }
+}
+
+/// In-memory rate limiter. Cheap to clone (everything's behind an
+/// `Arc`). Operator-supplied config is fixed for the lifetime of
+/// the process.
+#[derive(Clone)]
+pub struct MemoryLimiter {
+    inner: Arc<MemoryLimiterInner>,
+}
+
+struct MemoryLimiterInner {
     /// Per-tenant config: explicit overrides keyed by tenant name,
     /// plus a `default` fallback applied to any tenant not listed.
     overrides: HashMap<String, TenantLimits>,
@@ -181,8 +267,8 @@ struct TenantState {
     user_buckets: HashMap<String, Bucket>,
 }
 
-impl RateLimiter {
-    /// Build a rate limiter with the given default + overrides.
+impl MemoryLimiter {
+    /// Build an in-memory limiter with the given default + overrides.
     /// Both buckets being disabled (the default) is a no-op
     /// limiter; callers can keep the limiter wired into the proxy
     /// without overhead.
@@ -192,7 +278,7 @@ impl RateLimiter {
         observer: Arc<dyn LimiterObserver>,
     ) -> Self {
         Self {
-            inner: Arc::new(RateLimiterInner {
+            inner: Arc::new(MemoryLimiterInner {
                 overrides,
                 default,
                 state: Mutex::new(HashMap::new()),
@@ -201,8 +287,6 @@ impl RateLimiter {
         }
     }
 
-    /// True when *some* bucket is enabled — caller can skip the
-    /// check-and-acquire dance when it's not.
     pub fn is_active(&self) -> bool {
         self.inner.default.tenant.is_enabled()
             || self.inner.default.per_user.is_enabled()
@@ -213,13 +297,6 @@ impl RateLimiter {
                 .any(|l| l.tenant.is_enabled() || l.per_user.is_enabled())
     }
 
-    /// Take one token from the (tenant, user) bucket pair. Returns
-    /// `Ok(())` when both buckets had tokens available, or
-    /// `Err(Status::ResourceExhausted)` when either was empty.
-    ///
-    /// On rejection the observer is notified with the *first* scope
-    /// that failed — typically the more-restrictive of the two —
-    /// so metrics show which dimension is the bottleneck.
     pub fn check(&self, tenant: &str, user: &str) -> Result<(), Status> {
         let limits = self
             .inner
@@ -274,6 +351,8 @@ impl RateLimiter {
     }
 }
 
+pub mod redis;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +383,7 @@ mod tests {
 
     #[test]
     fn disabled_limiter_is_inactive_and_admits_everything() {
-        let r = RateLimiter::new(
+        let r = MemoryLimiter::new(
             TenantLimits::default(),
             HashMap::new(),
             Arc::new(NoopObserver),
@@ -317,7 +396,7 @@ mod tests {
 
     #[test]
     fn burst_allows_consecutive_then_rejects() {
-        let r = RateLimiter::new(limits(1.0, 5), HashMap::new(), Arc::new(NoopObserver));
+        let r = MemoryLimiter::new(limits(1.0, 5), HashMap::new(), Arc::new(NoopObserver));
         assert!(r.is_active());
         // 5 in a row should succeed (full burst).
         for _ in 0..5 {
@@ -331,7 +410,7 @@ mod tests {
     #[test]
     fn refill_lets_more_rpcs_through_after_a_wait() {
         // 10 RPS, burst 2. After ~250ms we should have ~2.5 tokens.
-        let r = RateLimiter::new(limits(10.0, 2), HashMap::new(), Arc::new(NoopObserver));
+        let r = MemoryLimiter::new(limits(10.0, 2), HashMap::new(), Arc::new(NoopObserver));
         r.check("t", "u").unwrap();
         r.check("t", "u").unwrap();
         // Bucket empty.
@@ -348,7 +427,7 @@ mod tests {
         // Default very restrictive; override generous.
         let mut overrides = HashMap::new();
         overrides.insert("team-a".to_string(), limits(100.0, 100));
-        let r = RateLimiter::new(limits(1.0, 1), overrides, Arc::new(NoopObserver));
+        let r = MemoryLimiter::new(limits(1.0, 1), overrides, Arc::new(NoopObserver));
 
         // Default tenant: only 1 RPC before reject.
         r.check("anyone-else", "u").unwrap();
@@ -362,7 +441,7 @@ mod tests {
 
     #[test]
     fn tenant_buckets_are_independent_across_tenants() {
-        let r = RateLimiter::new(limits(1.0, 2), HashMap::new(), Arc::new(NoopObserver));
+        let r = MemoryLimiter::new(limits(1.0, 2), HashMap::new(), Arc::new(NoopObserver));
         // Exhaust team-a's bucket.
         r.check("team-a", "u").unwrap();
         r.check("team-a", "u").unwrap();
@@ -375,7 +454,7 @@ mod tests {
     #[test]
     fn per_user_bucket_protects_one_user_without_blocking_others() {
         // Tenant bucket generous, per-user bucket tight: 2 burst.
-        let r = RateLimiter::new(
+        let r = MemoryLimiter::new(
             limits_with_user(100.0, 100, 1.0, 2),
             HashMap::new(),
             Arc::new(NoopObserver),
@@ -411,7 +490,7 @@ mod tests {
         // Tenant burst 1, user burst 1: first RPC consumes both;
         // second is rejected by *tenant* (checked first), third —
         // after we let tenant refill — should hit user.
-        let r = RateLimiter::new(
+        let r = MemoryLimiter::new(
             limits_with_user(1000.0, 1, 1000.0, 1),
             HashMap::new(),
             counter.clone(),

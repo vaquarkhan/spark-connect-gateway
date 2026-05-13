@@ -7,9 +7,11 @@ publish = false
 
 [dependencies]
 parking_lot = { workspace = true }
+redis = { workspace = true, features = ["script"] }
+tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+testcontainers-modules = { workspace = true }

@@ -209,7 +209,7 @@ impl SparkConnectProxy {
         let identity = self.authenticate(metadata, rid, rpc).await?;
         let tenant = self.tenant_resolver.resolve(metadata, &identity)?;
         if let Some(limiter) = &self.rate_limiter {
-            limiter.check(&tenant, &identity.user_id)?;
+            limiter.check(&tenant, &identity.user_id).await?;
         }
         Ok((identity, tenant))
     }

@@ -14,9 +14,10 @@ use scg_auth::{
 };
 use scg_config::{
     AffinityStoreConfig, AuditSettings, AuthConfig, BackendDiscovery, BucketSettings, Config,
-    HealthCheckSettings, JwtSettings, KeySource as CfgKeySource, OidcSettings, RateLimitSettings,
-    RedisStoreSettings, TenantOnMissing, TenantResolverSettings, TenantResolverSource,
-    TokenEntry as CfgTokenEntry, TracingSettings, UnknownTenantPolicySetting,
+    HealthCheckSettings, JwtSettings, KeySource as CfgKeySource, OidcSettings, RateLimitFailMode,
+    RateLimitRedisSettings, RateLimitSettings, RateLimitStore, RedisStoreSettings, TenantOnMissing,
+    TenantResolverSettings, TenantResolverSource, TokenEntry as CfgTokenEntry, TracingSettings,
+    UnknownTenantPolicySetting,
 };
 use scg_genproto::pb::spark_connect_service_server::SparkConnectServiceServer;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
@@ -26,7 +27,11 @@ use scg_observability::{
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
-use scg_ratelimit::{BucketRate, LimiterObserver, RateLimiter, RejectScope, TenantLimits};
+use scg_ratelimit::redis::{RedisLimiter, RedisLimiterConfig};
+use scg_ratelimit::{
+    BucketRate, FailMode, LimiterObserver, MemoryLimiter, RateLimiter, RedisErrorObserver,
+    RejectScope, TenantLimits,
+};
 use scg_routing::{AffinityStore, Pool, Router, UnknownTenantPolicy};
 use scg_store_memory::MemoryStore;
 use scg_store_redis::{RedisStore, RedisStoreConfig};
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
 
     let auth = build_auth(&cfg.auth).await?;
     let tenant_resolver = build_tenant_resolver(&cfg.tenant_resolver);
-    let rate_limiter = build_rate_limiter(&cfg.rate_limit, &metrics);
+    let rate_limiter = build_rate_limiter(&cfg.rate_limit, &metrics).await?;
     let audit = build_audit_logger(&cfg.audit);
     let svc = SparkConnectProxy::with_all(
         router,
@@ -353,6 +358,20 @@ impl LimiterObserver for MetricsLimiterObserver {
     }
 }
 
+/// Adapter for `scg_rate_limit_redis_errors_total` — bumped by the
+/// Redis-backed limiter when an EVAL fails. Distinct from
+/// `LimiterObserver` because Redis errors and rate-limit rejections
+/// are different events (an error doesn't necessarily reject).
+struct MetricsRedisErrorObserver {
+    metrics: Metrics,
+}
+
+impl RedisErrorObserver for MetricsRedisErrorObserver {
+    fn on_redis_error(&self, tenant: &str, reason: &'static str) {
+        self.metrics.record_rate_limit_redis_error(tenant, reason);
+    }
+}
+
 fn bucket_rate(rps: f64, burst: u64) -> BucketRate {
     BucketRate {
         rpcs_per_second: rps,
@@ -370,9 +389,17 @@ fn tenant_limits_from(cfg: &BucketSettings) -> TenantLimits {
 /// Build the configured [`RateLimiter`]. Returns `None` when
 /// `rate_limit.enabled: false` (the default) so the proxy hot
 /// path can skip the check entirely.
-fn build_rate_limiter(cfg: &RateLimitSettings, metrics: &Metrics) -> Option<RateLimiter> {
+///
+/// `memory` is sync to build; `redis` dials the server eagerly so
+/// a misconfigured URL / unreachable host surfaces at startup
+/// instead of the first inbound RPC. Per-RPC Redis failures take
+/// the configured [`FailMode`] path inside the limiter.
+async fn build_rate_limiter(
+    cfg: &RateLimitSettings,
+    metrics: &Metrics,
+) -> Result<Option<RateLimiter>> {
     if !cfg.enabled {
-        return None;
+        return Ok(None);
     }
     let default = tenant_limits_from(&cfg.default);
     let overrides: std::collections::HashMap<String, TenantLimits> = cfg
@@ -383,7 +410,33 @@ fn build_rate_limiter(cfg: &RateLimitSettings, metrics: &Metrics) -> Option<Rate
     let observer = Arc::new(MetricsLimiterObserver {
         metrics: metrics.clone(),
     });
-    Some(RateLimiter::new(default, overrides, observer))
+    match cfg.store {
+        RateLimitStore::Memory => Ok(Some(RateLimiter::Memory(MemoryLimiter::new(
+            default, overrides, observer,
+        )))),
+        RateLimitStore::Redis => {
+            let redis_obs = Arc::new(MetricsRedisErrorObserver {
+                metrics: metrics.clone(),
+            });
+            let redis_cfg = rate_limit_redis_config(&cfg.redis);
+            let limiter = RedisLimiter::connect(redis_cfg, default, overrides, observer, redis_obs)
+                .await
+                .with_context(|| format!("connecting rate-limit redis at {}", cfg.redis.url,))?;
+            Ok(Some(RateLimiter::Redis(limiter)))
+        }
+    }
+}
+
+fn rate_limit_redis_config(s: &RateLimitRedisSettings) -> RedisLimiterConfig {
+    RedisLimiterConfig {
+        url: s.url.clone(),
+        key_prefix: s.key_prefix.clone(),
+        key_ttl: std::time::Duration::from_secs(s.key_ttl_secs),
+        fail_mode: match s.on_failure {
+            RateLimitFailMode::Open => FailMode::Open,
+            RateLimitFailMode::Closed => FailMode::Closed,
+        },
+    }
 }
 
 /// Translate the YAML `audit:` block into the runtime [`AuditLogger`].
@@ -510,6 +563,10 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
         TenantOnMissing::Reject => "reject",
     };
     let rate_limit_enabled = cfg.rate_limit.enabled;
+    let rate_limit_store = match cfg.rate_limit.store {
+        RateLimitStore::Memory => "memory",
+        RateLimitStore::Redis => "redis",
+    };
     let audit_enabled = cfg.audit.enabled;
     match &cfg.discovery {
         BackendDiscovery::Static { addresses } => {
@@ -522,6 +579,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 tenant_source,
                 tenant_on_missing,
                 rate_limit = rate_limit_enabled,
+                rate_limit_store,
                 audit = audit_enabled,
                 backends = ?addresses,
                 "spark-connect-gateway starting"
@@ -541,6 +599,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 tenant_source,
                 tenant_on_missing,
                 rate_limit = rate_limit_enabled,
+                rate_limit_store,
                 audit = audit_enabled,
                 namespace = %namespace,
                 service = %service_name,

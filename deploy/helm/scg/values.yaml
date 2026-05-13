@@ -178,8 +178,28 @@ redis:
 #       burst: 1000
 #       perUserRpcsPerSecond: 50
 #       perUserBurst: 100
+#
+# `store: memory` (the default) enforces buckets per gateway replica
+# — a 3-replica deployment with default.rpcsPerSecond=100 admits up
+# to 300 RPS cluster-wide. `store: redis` shares state across all
+# replicas via an atomic token-bucket Lua script, so the configured
+# rate matches the cluster-wide enforcement. See `redis:` below.
 rateLimit:
   enabled: false
+  # one of: memory | redis
+  store: memory
+  # Redis settings — only consulted when store=redis. The fail
+  # behaviour `open` admits the RPC and bumps
+  # scg_rate_limit_redis_errors_total when Redis is unreachable;
+  # `closed` rejects with ResourceExhausted instead (recommended
+  # only for strict-SaaS deployments where availability of the
+  # limiter is part of the security model).
+  redis:
+    url: "redis://redis:6379"
+    keyPrefix: "scg-rl"
+    keyTtlSecs: 3600
+    # one of: open | closed
+    onFailure: open
   default:
     rpcsPerSecond: 0
     burst: 0

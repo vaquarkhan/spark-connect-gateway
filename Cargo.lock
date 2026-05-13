@@ -2352,6 +2352,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "ryu",
+ "sha1_smol",
  "socket2",
  "tokio",
  "tokio-util",
@@ -2717,6 +2718,8 @@ name = "scg-ratelimit"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "redis",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -2963,6 +2966,12 @@ dependencies = [
  "serde",
  "unsafe-libyaml",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"

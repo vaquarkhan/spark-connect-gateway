@@ -239,10 +239,93 @@ pub struct RateLimitSettings {
     /// performed even if `default` / `overrides` are populated.
     #[serde(default)]
     pub enabled: bool,
+    /// Backend store for the bucket state. `memory` (default)
+    /// enforces quotas per gateway replica; `redis` shares state
+    /// across all replicas via a Lua-driven token bucket. See
+    /// Phase 3.7 docs for the trade-off.
+    #[serde(default)]
+    pub store: RateLimitStore,
+    /// Redis connection settings — only consulted when `store: redis`.
+    #[serde(default)]
+    pub redis: RateLimitRedisSettings,
     #[serde(default)]
     pub default: BucketSettings,
     #[serde(default)]
     pub overrides: std::collections::HashMap<String, BucketSettings>,
+}
+
+/// Which backend stores the token-bucket state.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitStore {
+    /// Each gateway replica enforces its own bucket. Fine for
+    /// single-replica deployments or back-pressure-style limiting.
+    #[default]
+    Memory,
+    /// Atomic token bucket in Redis, shared across all replicas.
+    /// The effective cluster-wide quota matches the configured
+    /// rates exactly.
+    Redis,
+}
+
+/// Redis settings for the distributed limiter. Defaults are
+/// dev-friendly — production should override `url`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitRedisSettings {
+    /// Redis URL. e.g. `redis://redis.spark-connect.svc:6379`.
+    #[serde(default = "default_rate_limit_redis_url")]
+    pub url: String,
+    /// Key prefix. All limiter keys live under `{key_prefix}:t:*`
+    /// (tenant) and `{key_prefix}:u:*` (user). Default `scg-rl` —
+    /// distinct from the affinity store's prefix so flushing one
+    /// doesn't disturb the other.
+    #[serde(default = "default_rate_limit_redis_key_prefix")]
+    pub key_prefix: String,
+    /// TTL for an idle bucket key in seconds. Default 3600 (one
+    /// hour) — long enough that an idle tenant doesn't lose its
+    /// bucket, short enough that one-off keys GC themselves.
+    #[serde(default = "default_rate_limit_redis_key_ttl_secs")]
+    pub key_ttl_secs: u64,
+    /// Behaviour when Redis is unreachable. `open` (default) admits
+    /// the RPC and bumps `scg_rate_limit_redis_errors_total`;
+    /// `closed` rejects the RPC with `ResourceExhausted`.
+    #[serde(default)]
+    pub on_failure: RateLimitFailMode,
+}
+
+impl Default for RateLimitRedisSettings {
+    fn default() -> Self {
+        Self {
+            url: default_rate_limit_redis_url(),
+            key_prefix: default_rate_limit_redis_key_prefix(),
+            key_ttl_secs: default_rate_limit_redis_key_ttl_secs(),
+            on_failure: RateLimitFailMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitFailMode {
+    /// Admit the RPC; bump the error metric. Recommended default —
+    /// availability over strict quotas.
+    #[default]
+    Open,
+    /// Reject the RPC with `ResourceExhausted`. Use for strict-SaaS
+    /// deployments where a Redis outage must not become a
+    /// quota-bypass vector; makes Redis a hard request-path
+    /// dependency.
+    Closed,
+}
+
+fn default_rate_limit_redis_url() -> String {
+    "redis://localhost:6379".into()
+}
+fn default_rate_limit_redis_key_prefix() -> String {
+    "scg-rl".into()
+}
+fn default_rate_limit_redis_key_ttl_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1141,6 +1224,52 @@ rate_limit:
         assert_eq!(a.burst, 1000);
         assert_eq!(a.per_user_rpcs_per_second, 50.0);
         assert_eq!(a.per_user_burst, 100);
+    }
+
+    #[test]
+    fn rate_limit_store_defaults_to_memory() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+rate_limit:
+  enabled: true
+  default:
+    rpcs_per_second: 100
+    burst: 200
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert_eq!(c.rate_limit.store, RateLimitStore::Memory);
+        // Redis defaults are present but irrelevant when store=memory.
+        assert_eq!(c.rate_limit.redis.url, "redis://localhost:6379");
+        assert_eq!(c.rate_limit.redis.key_prefix, "scg-rl");
+        assert_eq!(c.rate_limit.redis.on_failure, RateLimitFailMode::Open);
+    }
+
+    #[test]
+    fn loads_rate_limit_with_redis_store() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+rate_limit:
+  enabled: true
+  store: redis
+  redis:
+    url: "redis://shared.svc:6379"
+    key_prefix: "myrl"
+    key_ttl_secs: 7200
+    on_failure: closed
+  default:
+    rpcs_per_second: 100
+    burst: 200
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert_eq!(c.rate_limit.store, RateLimitStore::Redis);
+        assert_eq!(c.rate_limit.redis.url, "redis://shared.svc:6379");
+        assert_eq!(c.rate_limit.redis.key_prefix, "myrl");
+        assert_eq!(c.rate_limit.redis.key_ttl_secs, 7200);
+        assert_eq!(c.rate_limit.redis.on_failure, RateLimitFailMode::Closed);
     }
 
     #[test]

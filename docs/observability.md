@@ -121,6 +121,29 @@ means the configured limit is too tight (or that a single client
 is running away). Bump `rateLimit.overrides.<tenant>` in
 `values.yaml` and `helm upgrade`.
 
+### `scg_rate_limit_redis_errors_total{tenant, reason}` — counter
+
+Backend errors from the Redis-backed rate limiter (Phase 3.7).
+Counts *errors*, not rejects: a fail-open deployment increments
+this without firing `scg_rate_limit_rejected_total`. `reason` is
+one of `tenant_bucket` or `user_bucket`. Only ever nonzero when
+`rateLimit.store: redis`.
+
+```promql
+# Are we losing limiter visibility right now?
+sum(rate(scg_rate_limit_redis_errors_total[1m])) > 0
+
+# Which tenants are affected — useful for noisy-neighbor outages
+sum by (tenant) (rate(scg_rate_limit_redis_errors_total[5m]))
+```
+
+A sustained nonzero rate is a Redis problem (network, auth,
+restart, slow log), not a quota problem. On a fail-open deployment
+this means quotas aren't being enforced for the affected requests;
+on fail-closed it means RPCs are being thrown out without ever
+touching a backend. Alert at the same threshold you'd alert on
+Redis availability for the affinity store.
+
 ### `scg_backend_pool_size` — gauge
 
 Current count of healthy backends the gateway will route to. Set

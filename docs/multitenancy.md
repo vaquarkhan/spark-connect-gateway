@@ -28,7 +28,7 @@ What Phase 3 actually gives you:
 |---|---|
 | Per-tenant identity from auth | `tenantResolver` reads the JWT/static-token tenant claim, a gRPC metadata header, or a fixed string. |
 | Per-tenant backend pools | `tenantPools.overrides` pins a tenant to a dedicated Spark Connect cluster; everything else falls through to a shared default. |
-| Per-tenant quotas | `rateLimit.overrides` sets a token-bucket RPS / burst per tenant; opt-in per-user dimension inside a tenant. |
+| Per-tenant quotas | `rateLimit.overrides` sets a token-bucket RPS / burst per tenant; opt-in per-user dimension inside a tenant; per-replica or Redis-shared via `rateLimit.store`. |
 | Tenant-aware audit trail | Every audit event (`session.create`, `auth.failure`, `rpc.error`, …) carries the resolved tenant in a structured field. |
 | Strict-isolation mode | Pair `onMissing=reject` (resolver) with `onUnknownTenant=reject` (pools) so RPCs from unmapped tenants never reach a backend. |
 
@@ -324,6 +324,68 @@ own staging environment. The Go/Python/JVM Spark Connect clients
 all accept a Bearer token via metadata, so you can drive equivalent
 assertions from any of them.
 
+## Distributed rate limiting (Phase 3.7)
+
+The rate limiter has two backends. Pick by your replica count:
+
+| `rateLimit.store` | Where state lives | Effective cluster-wide quota |
+|---|---|---|
+| `memory` (default) | Per gateway replica | `N × default.rpcsPerSecond` for N replicas |
+| `redis` | One Redis instance, shared | Exactly `default.rpcsPerSecond` |
+
+The memory backend is fine for single-replica deployments or
+back-pressure-style limiting where being inside 2× of the configured
+quota is acceptable. Switch to `redis` when you need a strict
+cluster-wide cap — typical SaaS billing-tier enforcement.
+
+Sample `redis` config:
+
+```yaml
+rateLimit:
+  enabled: true
+  store: redis
+  redis:
+    url: "redis://redis.spark-connect.svc:6379"
+    keyPrefix: "scg-rl"
+    keyTtlSecs: 3600
+    onFailure: open      # open | closed
+  default:
+    rpcsPerSecond: 100
+    burst: 200
+```
+
+**Fail mode** is the question worth thinking about up front:
+
+* `onFailure: open` (default) — when Redis is unreachable, admit
+  the RPC and bump `scg_rate_limit_redis_errors_total{tenant, reason}`.
+  Matches the Phase 2 affinity-store behaviour: availability over
+  strict quotas. The error metric makes the outage visible so you
+  can alert on a sustained nonzero rate.
+* `onFailure: closed` — when Redis is unreachable, reject the RPC
+  with `ResourceExhausted`. Pick this if a Redis outage must not
+  become a quota-bypass vector (regulated SaaS). Note that this
+  makes Redis a hard request-path dependency — Redis down means
+  every RPC throttled.
+
+**Operational notes:**
+
+* The limiter uses a Lua script via plain `EVAL`/`EVALSHA`, not the
+  `redis-cell` module. It works on any Redis 6+, including managed
+  offerings (ElastiCache, MemoryStore, Upstash) that don't allow
+  `loadmodule`.
+* Reuse the same Redis instance as the affinity store — the limiter
+  uses a different `keyPrefix` (default `scg-rl` vs. affinity's
+  `scg`) so a `FLUSH` of one won't disturb the other. Helm chart
+  defaults assume a shared `redis` Service.
+* Bucket keys self-expire after `keyTtlSecs` so abandoned tenants
+  don't leak Redis memory.
+
+Verify by running two gateway replicas with the same Redis: their
+combined RPS for one tenant must stay under `default.rpcsPerSecond +
+burst`, not double it. The integration test
+[`crates/ratelimit/tests/redis_integration.rs`](../crates/ratelimit/tests/redis_integration.rs)
+covers this case under `two_replicas_share_the_bucket`.
+
 ## What's not here yet
 
 Phase 3 deliberately scopes itself to the **data plane**. Things
@@ -337,11 +399,6 @@ that fall to a later phase:
   backends; it doesn't ask K8s to create a Spark Connect server on
   demand for a tenant. Stand up pools out-of-band.
 * **Warm pool per tenant** (3.5) — no pre-provisioning logic.
-* **Distributed rate limiting** (3.7) — the limiter is in-process
-  per gateway replica. For a 3-replica deployment with `default.rpcsPerSecond: 100`,
-  the *effective* per-tenant quota across the cluster is ~300 RPS,
-  not 100. Either size your quotas accordingly or wait for the
-  Redis-backed variant.
 
 For status of the broader plan, see the
 [implementation plan](../../plans/IMPLEMENTATION-PLAN-OSS-Spark-Connect-Gateway.md).

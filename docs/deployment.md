@@ -299,7 +299,7 @@ tenant from the resolver — routes through the deployment's single
 pool. This is identical to Phase 1/2 behaviour. You opt into
 multi-tenant routing by listing tenants you want isolated.
 
-## Per-tenant rate limiting (Phase 3.6)
+## Per-tenant rate limiting (Phases 3.6 / 3.7)
 
 When a single tenant can monopolize the shared backends — bursts
 of session creation, runaway PySpark notebooks, malicious
@@ -307,6 +307,18 @@ clients — rate limiting protects the rest. The gateway implements
 a token bucket per tenant (and optionally per user inside the
 tenant); every RPC takes a token, RPCs that find an empty bucket
 fail with `RESOURCE_EXHAUSTED`.
+
+**Two store backends:**
+
+* `rateLimit.store: memory` (default) — bucket state in each
+  gateway replica. Simple, no extra infra, but the effective
+  cluster-wide quota is `N × rpcsPerSecond` for N replicas.
+* `rateLimit.store: redis` — atomic token bucket in Redis via a
+  Lua script, shared across all replicas. Cluster-wide enforcement
+  matches the configured rate exactly. See
+  [`multitenancy.md`](multitenancy.md#distributed-rate-limiting-phase-37)
+  for fail-mode semantics (`onFailure: open | closed`) and the
+  `scg_rate_limit_redis_errors_total` metric.
 
 Off by default. Turn on with:
 

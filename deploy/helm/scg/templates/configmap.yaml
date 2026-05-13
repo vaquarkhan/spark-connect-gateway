@@ -133,6 +133,14 @@ data:
     {{- if .Values.rateLimit.enabled }}
     rate_limit:
       enabled: true
+      store: {{ default "memory" .Values.rateLimit.store }}
+      {{- if eq (default "memory" .Values.rateLimit.store) "redis" }}
+      redis:
+        url: {{ .Values.rateLimit.redis.url | quote }}
+        key_prefix: {{ .Values.rateLimit.redis.keyPrefix | quote }}
+        key_ttl_secs: {{ .Values.rateLimit.redis.keyTtlSecs }}
+        on_failure: {{ .Values.rateLimit.redis.onFailure | quote }}
+      {{- end }}
       default:
         rpcs_per_second: {{ .Values.rateLimit.default.rpcsPerSecond }}
         burst: {{ .Values.rateLimit.default.burst }}

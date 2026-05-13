@@ -53,6 +53,12 @@ struct MetricsInner {
 
     // Rate limit.
     rate_limit_rejected_total: IntCounterVec,
+    /// Redis-side errors observed by the distributed rate limiter
+    /// (Phase 3.7). Counts errors, not rejects — a fail-open
+    /// deployment increments this without firing
+    /// `rate_limit_rejected_total`. `reason` is one of a small fixed
+    /// set: `tenant_bucket`, `user_bucket`.
+    rate_limit_redis_errors_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -103,6 +109,12 @@ impl Metrics {
             &["tenant", "scope"],
             registry,
         )?;
+        let rate_limit_redis_errors_total = register_int_counter_vec_with_registry!(
+            "scg_rate_limit_redis_errors_total",
+            "Backend errors from the Redis-backed rate limiter (Phase 3.7). Counts failures, not rejects.",
+            &["tenant", "reason"],
+            registry,
+        )?;
         Ok(Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -112,8 +124,19 @@ impl Metrics {
                 backend_pool_size,
                 active_streams,
                 rate_limit_rejected_total,
+                rate_limit_redis_errors_total,
             }),
         })
+    }
+
+    /// Bump `scg_rate_limit_redis_errors_total{tenant, reason}`.
+    /// `reason` is a small fixed-cardinality string from the limiter
+    /// (`tenant_bucket`, `user_bucket`).
+    pub fn record_rate_limit_redis_error(&self, tenant: &str, reason: &str) {
+        self.inner
+            .rate_limit_redis_errors_total
+            .with_label_values(&[tenant, reason])
+            .inc();
     }
 
     /// Bump `scg_rate_limit_rejected_total{tenant, scope}`. `scope`
