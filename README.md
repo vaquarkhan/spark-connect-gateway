@@ -1,14 +1,14 @@
 # spark-connect-gateway
 
 A stateless gRPC proxy that fronts a pool of [Apache Spark Connect][1]
-servers, providing session affinity, multi-tenant routing, and (in later
-phases) auth and observability features the open-source server intentionally
-leaves out.
+servers, providing session affinity, multi-tenant routing, auth, and
+observability features the open-source server intentionally leaves out.
 
-> **Status: Phase 1 (MVP) complete.** Rust workspace built with
-> [`tonic`](https://github.com/hyperium/tonic). Phase 1 is a passthrough
-> proxy — no auth, no HA, no observability. See [the implementation plan][2]
-> for the full roadmap.
+> Rust workspace built with [`tonic`](https://github.com/hyperium/tonic).
+> Production-ready surface: JWT/OIDC auth, K8s service-watch discovery,
+> Redis-backed multi-replica HA, per-tenant routing + rate limiting,
+> structured audit logging, Prometheus metrics, OpenTelemetry tracing,
+> Helm chart with sensible defaults.
 
 ## What it does
 
@@ -238,11 +238,11 @@ Both stickiness invariants are preserved across replicas:
 If Redis becomes unreachable, the gateway logs `warn!` per failed
 operation and degrades to pool-only routing — sessions land on
 whatever backend the pool picks each time, which is exactly the
-Phase-1 in-memory behaviour seen by a single replica. Service
-remains available; HA stickiness recovers as soon as Redis does.
+single-replica in-memory behaviour. Service remains available; HA
+stickiness recovers as soon as Redis does.
 
 `affinity_store` defaults to `type: memory` (no entry needed),
-matching Phase-1 behaviour.
+matching the single-replica baseline.
 
 #### Verifying HA locally
 
@@ -300,7 +300,7 @@ For day-2 operations, see:
   runbook: prerequisites, install, hardening, upgrades, uninstall.
 * [`docs/multitenancy.md`](docs/multitenancy.md) — multi-tenant
   setup guide: decision matrix, three sample configs (permissive,
-  strict, single-tenant on Phase 3), migration paths.
+  strict, single-tenant), migration paths.
 * [`docs/observability.md`](docs/observability.md) — every `scg_*`
   metric explained, PromQL examples, log line anatomy, distributed
   tracing guide, suggested alerts.
@@ -335,10 +335,8 @@ The gateway watches the `Endpoints` object via `kube-rs`. When pods are added,
 removed, or restarted, the gateway's backend list updates within seconds —
 no `kubectl rollout` of the gateway, no config edit. The gateway pod needs a
 `ServiceAccount` with `get`, `list`, and `watch` on `endpoints` in the target
-namespace.
-
-Phase 2 will add a Helm chart that wires up the `ServiceAccount` and `Role`
-for you.
+namespace; the Helm chart at `deploy/helm/scg/` wires up the `ServiceAccount`
+and `Role` automatically.
 
 ## Architecture
 
@@ -348,9 +346,9 @@ client (sc://) ──▶ gateway ──┬──▶ Spark Connect server #1
                              └──▶ Spark Connect server #N
 ```
 
-- **No state in the gateway process** beyond an in-memory affinity cache.
-  Phase 2 moves that state to Redis or Postgres so multiple gateway replicas
-  can share it.
+- **No state in the gateway process** beyond an in-memory affinity cache
+  (single-replica deployments). Multi-replica deployments swap in
+  `scg-store-redis` so all replicas share the same affinity table.
 - **No interpretation of Spark Connect plans.** The gateway forwards every
   message verbatim, which means it stays compatible with whatever upstream
   Spark Connect adds in future versions.
@@ -359,13 +357,21 @@ client (sc://) ──▶ gateway ──┬──▶ Spark Connect server #1
 
 ```
 crates/
-  gateway/       # binary entry point
-  proxy/         # SparkConnectService impl that forwards every RPC
-  routing/       # SessionKey, Pool/AffinityStore traits, Router
-  store-memory/  # Phase-1 in-memory affinity store
-  pool-static/   # static backend pool (round-robin)
-  config/        # YAML config loader
-  genproto/      # tonic-generated bindings for spark.connect.*
+  gateway/        # binary entry point
+  proxy/          # SparkConnectService impl that forwards every RPC
+  routing/        # SessionKey, Pool/AffinityStore traits, Router, TenantRouter
+  store-memory/   # in-memory AffinityStore (single-replica)
+  store-redis/    # Redis-backed AffinityStore (multi-replica HA)
+  pool-static/    # static backend pool (round-robin)
+  pool-k8s/       # K8s Endpoints-watch backend pool
+  healthcheck/    # HealthAwarePool — active gRPC health probes
+  auth/           # static-token / JWT / OIDC authenticators
+  tenant/         # tenant resolver (from-claim / from-metadata / fixed)
+  ratelimit/      # in-memory + Redis-backed token bucket
+  audit/          # structured audit-event emitter
+  observability/  # metrics, tracing, admin server
+  config/         # YAML config loader
+  genproto/       # tonic-generated bindings for spark.connect.*
 proto/spark/connect/
   *.proto        # vendored read-only mirror of upstream
 deploy/examples/
@@ -388,23 +394,48 @@ cargo build -p scg-genproto
 
 `protoc` must be on `$PATH` (e.g. `brew install protobuf`).
 
-## Roadmap
+## What ships today
 
-- **Phase 1 — MVP (done).** Streaming proxy, static pool, in-memory
-  affinity, in-process tests against fake backends.
-- **Phase 2 — Production (done).** JWT/OIDC auth, K8s service-watch
-  backend pool, Redis affinity store with multi-replica HA, Prometheus
-  metrics, OpenTelemetry tracing (root-span case), active gRPC health
-  checks, graceful shutdown drain, Helm chart, multi-replica HA test,
-  load harness + perf baseline, operator docs. Five items (2.7
-  Postgres store, 2.10 least-loaded, 2.11 gateway-side drain, 2.13
-  inbound-traceparent fix, 2.16 hot reload) intentionally deferred —
-  see [the plan][2] §4.4 for the rationale on each and when to
-  revisit.
-- **Phase 3 — Multi-tenant (next).** Per-tenant backend pools,
-  cold-start provisioning, warm pools, rate limiting, audit logging.
+**Proxy core.** Streaming forward of every `SparkConnectService` RPC.
+Session affinity pinned by `(tenant, user_id, session_id)` so a
+client's RPCs always reach the same backend driver. Operation-id
+reverse index so `ReattachExecute` / `ReleaseExecute` / `Interrupt`
+reach the right driver even after the session binding has expired.
 
-See [the full plan][2] for details.
+**Backend discovery.** Static list, or K8s Endpoints watch via
+`kube-rs` — pool updates within seconds of pod changes, no gateway
+restart.
+
+**Multi-replica HA.** Redis-backed shared affinity store. Two-step
+graceful shutdown drains in-flight streams before the gRPC server
+stops.
+
+**Auth.** Pluggable: anonymous (default — trusted networks only),
+static token, JWT (local public key), OIDC (remote JWKS / discovery).
+Verified `Identity` overwrites the client-supplied `UserContext.user_id`
+on forward.
+
+**Multi-tenancy.** Tenant resolver reads from the auth claim, a gRPC
+metadata header, or a fixed string. Per-tenant backend pool overrides
+with `UseDefault` / `Reject` policies for unknown tenants. Per-tenant
+token-bucket rate limiting with optional per-user sub-bucket; in-memory
+or Redis-shared.
+
+**Audit + observability.** Structured audit events (`session.create`,
+`session.release`, `auth.failure`, `rpc.error`) with `target=scg::audit`.
+Prometheus metrics covering RPC throughput / duration / auth failures /
+pool size / active streams / rate-limit rejections. OpenTelemetry tracing
+with W3C `traceparent` propagation. Active gRPC health probing.
+
+**Deployment.** Helm chart with sensible defaults (2-replica HA + bundled
+Redis); separate values overlays for K8s discovery, JWT/OIDC auth,
+external Redis, tracing.
+
+**Known gaps.** Weighted backend selection per tenant, cold-start
+provisioning of new tenant pools, and per-tenant warm pools are
+roadmap items. Distributed-trace continuity for inbound `traceparent`
+is limited by upstream `tracing-opentelemetry` ↔ `opentelemetry_sdk`
+plumbing; root-span traces work end-to-end.
 
 
 

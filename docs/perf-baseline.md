@@ -1,12 +1,12 @@
 # Performance baseline
 
-Reference numbers for the Phase 2 gateway. The point of this document
+Reference numbers for the gateway. The point of this document
 isn't to claim "the gateway does N QPS" — your actual numbers will
 differ widely with hardware, network, and workload. The point is to
 have a reproducible *starting point* so:
 
-* Phase 3 (multi-tenant) can compare its overhead against a known
-  baseline.
+* Future feature work (per-tenant routing, rate limiting, audit)
+  can compare its overhead against a known baseline.
 * Operators alarmed by their own perf numbers have something to
   compare to.
 * Regressions get caught — re-run the harness on a release branch
@@ -192,8 +192,9 @@ work. Things that *will* shift these numbers in real deployments
 * Before every release branch (perf regression check).
 * After any change to the routing hot path, the auth interceptor,
   or the metrics handle.
-* As the Phase 3 multi-tenant work lands — the per-tenant routing
-  and quotas will add overhead; this baseline is the comparison.
+* When new hot-path features land — per-tenant routing, rate
+  limiting, and audit each add some overhead; this baseline is
+  the before-and-after comparison.
 
 ## Limitations
 

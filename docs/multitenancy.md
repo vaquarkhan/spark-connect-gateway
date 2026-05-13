@@ -22,7 +22,7 @@ session_id)`, so `(team-a, alice, sess-1)` is a different binding
 from `(team-b, alice, sess-1)` — two tenants can reuse session ids
 without colliding.
 
-What Phase 3 actually gives you:
+What the gateway gives you at the data plane:
 
 | Capability | How |
 |---|---|
@@ -32,7 +32,7 @@ What Phase 3 actually gives you:
 | Tenant-aware audit trail | Every audit event (`session.create`, `auth.failure`, `rpc.error`, …) carries the resolved tenant in a structured field. |
 | Strict-isolation mode | Pair `onMissing=reject` (resolver) with `onUnknownTenant=reject` (pools) so RPCs from unmapped tenants never reach a backend. |
 
-What's deliberately **not** in Phase 3 — see [What's not here
+What's deliberately **not** here — see [What's not here
 yet](#whats-not-here-yet) at the end.
 
 ## The four building blocks
@@ -47,7 +47,7 @@ make sense.
 (`x-tenant` header), or `always_default` (single-tenant). `onMissing`
 decides what happens when the source yields nothing — `use_default`
 falls back to `defaultName`, `reject` returns `Unauthenticated`. See
-[Multi-tenant: picking a tenant resolver](deployment.md#multi-tenant-picking-a-tenant-resolver-phase-3)
+[Multi-tenant: picking a tenant resolver](deployment.md#multi-tenant-picking-a-tenant-resolver)
 for the full decision table.
 
 ### 2. `tenantPools` — which backends does each tenant use?
@@ -56,7 +56,7 @@ for the full decision table.
 **default** pool; `tenantPools.overrides.<tenant>` adds a dedicated
 pool (`static` or `k8s` discovery). `tenantPools.onUnknownTenant`
 mirrors the resolver's `onMissing` policy at the routing layer. See
-[Per-tenant pools](deployment.md#per-tenant-pools-phase-32).
+[Per-tenant pools](deployment.md#per-tenant-pools).
 
 ### 3. `rateLimit` — protect tenants from each other's bursts
 
@@ -64,7 +64,7 @@ Off by default. Set `rateLimit.enabled: true` and supply
 `rateLimit.default` plus optional `rateLimit.overrides.<tenant>`.
 Quota violations surface as `RESOURCE_EXHAUSTED` and increment
 `scg_rate_limit_rejected_total{tenant, scope}`. See
-[Per-tenant rate limiting](deployment.md#per-tenant-rate-limiting-phase-36).
+[Per-tenant rate limiting](deployment.md#per-tenant-rate-limiting).
 
 ### 4. `audit` — who did what, when
 
@@ -72,7 +72,7 @@ Emits four event types by default (`session.create`,
 `session.release`, `auth.failure`, `rpc.error`) tagged with
 `target=scg::audit` so you can split them out in Loki/Splunk. Every
 event carries the tenant. See
-[Audit logging](deployment.md#audit-logging-phase-38) for chart
+[Audit logging](deployment.md#audit-logging) for chart
 config and [the event schema](observability.md#audit-logging) for
 fields and sample queries.
 
@@ -107,19 +107,19 @@ Pick this when:
 
 See [Sample 2](#sample-2-strict-multi-tenant).
 
-### Shape C: **Single-tenant on Phase 3 code**
+### Shape C: **Single-tenant**
 
-You're upgrading from a Phase 1/2 deployment and want Phase 3's
-codebase (auth, observability improvements, audit) without changing
-operational semantics. Every RPC routes to `tenant="default"`.
+You want the gateway's full feature surface (auth, observability,
+audit) but only have one tenant. Every RPC routes to
+`tenant="default"`.
 
 Pick this when:
-* You're upgrading and don't yet need multi-tenant routing.
+* You don't need multi-tenant routing yet.
 * You want the audit stream + per-tenant metric labels even though
   there's only one tenant.
 
-See [Sample 3](#sample-3-single-tenant-on-phase-3-code) — this is
-the chart's default, no per-tenant config needed.
+See [Sample 3](#sample-3-single-tenant) — this is the chart's
+default, no per-tenant config needed.
 
 ## Sample configs
 
@@ -226,7 +226,7 @@ What you get:
 * Adding a new tenant is `helm upgrade` with a new entry under
   `tenantPools.overrides`.
 
-### Sample 3: Single-tenant on Phase 3 code
+### Sample 3: Single-tenant
 
 ```yaml
 # Defaults — included only to make the shape explicit. You can omit
@@ -249,14 +249,14 @@ audit:
   logSuccessfulRpcs: false
 ```
 
-This is what a Phase 1/2 → Phase 3 upgrade looks like with **zero**
-multi-tenant config. Every RPC ends up in `tenant="default"`; pool
-routing is unchanged; audit captures the four default events; metrics
-gain the `tenant` label but it's the same value everywhere.
+This is the no-multi-tenant-config shape. Every RPC ends up in
+`tenant="default"`; pool routing is unchanged; audit captures the
+four default events; metrics gain the `tenant` label but it's the
+same value everywhere.
 
 ## Migration paths
 
-### Phase 1/2 → Phase 3, no multi-tenancy
+### Adopting the gateway without multi-tenancy
 
 Helm upgrade. No values.yaml changes needed — the chart's defaults
 preserve single-pool single-tenant behaviour. Watch
@@ -304,8 +304,8 @@ exactly the signal you want for "I forgot to register this tenant".
 
 ## Verifying isolation
 
-If you want confidence the Phase 3 stack is doing what you expect
-in your environment, the
+If you want confidence the multi-tenant stack is doing what you
+expect in your environment, the
 [`crates/proxy/tests/multitenant_e2e.rs`](../crates/proxy/tests/multitenant_e2e.rs)
 integration test wires every multi-tenant feature together and
 asserts isolation along four axes:
@@ -324,7 +324,7 @@ own staging environment. The Go/Python/JVM Spark Connect clients
 all accept a Bearer token via metadata, so you can drive equivalent
 assertions from any of them.
 
-## Distributed rate limiting (Phase 3.7)
+## Distributed rate limiting
 
 The rate limiter has two backends. Pick by your replica count:
 
@@ -358,9 +358,9 @@ rateLimit:
 
 * `onFailure: open` (default) — when Redis is unreachable, admit
   the RPC and bump `scg_rate_limit_redis_errors_total{tenant, reason}`.
-  Matches the Phase 2 affinity-store behaviour: availability over
-  strict quotas. The error metric makes the outage visible so you
-  can alert on a sustained nonzero rate.
+  Matches the Redis affinity-store's fail-soft behaviour:
+  availability over strict quotas. The error metric makes the
+  outage visible so you can alert on a sustained nonzero rate.
 * `onFailure: closed` — when Redis is unreachable, reject the RPC
   with `ResourceExhausted`. Pick this if a Redis outage must not
   become a quota-bypass vector (regulated SaaS). Note that this
@@ -388,17 +388,14 @@ covers this case under `two_replicas_share_the_bucket`.
 
 ## What's not here yet
 
-Phase 3 deliberately scopes itself to the **data plane**. Things
-that fall to a later phase:
+The gateway deliberately scopes itself to the **data plane**.
+Roadmap items not yet implemented:
 
-* **Weighted backend selection per tenant** (3.3) — every tenant
-  pool currently uses round-robin / pool-internal load distribution.
-  A weighted scheme for tiered backends inside one tenant is on the
-  roadmap.
-* **Cold-start provisioning** (3.4) — the gateway routes to existing
+* **Weighted backend selection per tenant** — every tenant pool
+  currently uses round-robin / pool-internal load distribution.
+  A weighted scheme for tiered backends inside one tenant is on
+  the roadmap.
+* **Cold-start provisioning** — the gateway routes to existing
   backends; it doesn't ask K8s to create a Spark Connect server on
   demand for a tenant. Stand up pools out-of-band.
-* **Warm pool per tenant** (3.5) — no pre-provisioning logic.
-
-For status of the broader plan, see the
-[implementation plan](../../plans/IMPLEMENTATION-PLAN-OSS-Spark-Connect-Gateway.md).
+* **Warm pool per tenant** — no pre-provisioning logic.

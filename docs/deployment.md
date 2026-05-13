@@ -213,14 +213,14 @@ Production rule of thumb: `oidc` if you have an IdP, `jwt` if you're
 issuing JWTs in-house, `static` for a closed dev setup, `none` only
 for namespace-isolated clusters.
 
-## Multi-tenant: picking a tenant resolver (Phase 3)
+## Multi-tenant: picking a tenant resolver
 
 > **Looking for a one-page multi-tenant setup walkthrough?** See
 > [`multitenancy.md`](multitenancy.md) for the decision matrix,
 > three complete sample configs, and migration paths. The sections
 > below are the deep reference for each individual knob.
 
-The routing key the gateway uses for session affinity is now
+The routing key the gateway uses for session affinity is
 `(tenant, user_id, session_id)`. The tenant prefix lets two
 tenants share a gateway without their `session_id` namespaces
 colliding — `(team-a, alice, sess-1)` is a different key from
@@ -231,14 +231,14 @@ out which tenant each RPC belongs to. Pick by deployment shape:
 
 | Deployment shape | `source` | `onMissing` | Notes |
 |---|---|---|---|
-| **Phase 1/2 upgrading to Phase 3 code**, single-tenant | `from_claim` | `use_default` | The default. Tenant comes from the auth claim if there is one, otherwise falls back to `"default"`. Nothing changes operationally — every RPC ends up in `tenant="default"`. |
+| **Single-tenant** (default) | `from_claim` | `use_default` | The chart default. Tenant comes from the auth claim if there is one, otherwise falls back to `"default"`. Every RPC ends up in `tenant="default"`. |
 | **JWT/OIDC multi-tenant** with a `tenant` claim | `from_claim` | `reject` | Tenant from JWT. Reject any RPC whose verified identity has no tenant claim — that's almost always an IdP misconfiguration in SaaS-style deployments. |
 | **No auth but client cooperates** via metadata | `from_metadata` | `use_default` or `reject` | Tenant from a gRPC metadata header (default `x-tenant`). Use `reject` if every client *must* send the header; `use_default` is appropriate when missing-header clients are legitimate internal tools that should land in a default pool. |
-| **Single-tenant deployment running Phase 3 code** | `always_default` | n/a | Ignore claim and header; every RPC goes to `defaultName`. Use this when you want Phase 3 code but no multi-tenant routing. |
+| **Single-tenant, no auth, no headers** | `always_default` | n/a | Ignore claim and header; every RPC goes to `defaultName`. |
 
 The chart's default values are the first row above, so a fresh
-install retains Phase 1/2 single-tenant behaviour with zero
-config changes.
+install behaves as a single-tenant deployment with zero config
+changes.
 
 **Migration note**: when you switch a running deployment from
 `use_default` to `reject`, any client whose token doesn't carry a
@@ -247,7 +247,7 @@ change (issue tokens with tenant claims) before flipping
 `onMissing` to `reject`. Watch
 `scg_rpcs_total{code="Unauthenticated"}` during the change.
 
-## Per-tenant pools (Phase 3.2)
+## Per-tenant pools
 
 Building on the tenant resolver above: each tenant can route to a
 *different* backend pool. A SaaS deployment isolates team-A's
@@ -285,7 +285,7 @@ tenantPools:
 
 | Setting | Behaviour for a tenant not in `overrides` |
 |---|---|
-| `use_default` (default) | Route through the default pool. Back-compat with Phase 1/2 — every tenant shares the same backends. |
+| `use_default` (default) | Route through the default pool. Single-pool baseline — every tenant shares the same backends. |
 | `reject` | `PermissionDenied` to the client. Use for strict SaaS-style isolation; pairs naturally with `tenantResolver.onMissing=reject`. |
 
 Each per-tenant pool gets the same active health-check treatment
@@ -296,10 +296,10 @@ team-a backend doesn't affect team-b routing.
 **What back-compat looks like**: leaving `tenantPools.overrides`
 empty (the default) means every tenant — including the `default`
 tenant from the resolver — routes through the deployment's single
-pool. This is identical to Phase 1/2 behaviour. You opt into
-multi-tenant routing by listing tenants you want isolated.
+pool. This is the single-pool baseline. You opt into multi-tenant
+routing by listing tenants you want isolated.
 
-## Per-tenant rate limiting (Phases 3.6 / 3.7)
+## Per-tenant rate limiting
 
 When a single tenant can monopolize the shared backends — bursts
 of session creation, runaway PySpark notebooks, malicious
@@ -316,7 +316,7 @@ fail with `RESOURCE_EXHAUSTED`.
 * `rateLimit.store: redis` — atomic token bucket in Redis via a
   Lua script, shared across all replicas. Cluster-wide enforcement
   matches the configured rate exactly. See
-  [`multitenancy.md`](multitenancy.md#distributed-rate-limiting-phase-37)
+  [`multitenancy.md`](multitenancy.md#distributed-rate-limiting)
   for fail-mode semantics (`onFailure: open | closed`) and the
   `scg_rate_limit_redis_errors_total` metric.
 
@@ -357,7 +357,7 @@ whether the limits are biting and which scope (`tenant` vs `user`)
 is the bottleneck. See [`observability.md`](observability.md) for
 PromQL examples.
 
-## Audit logging (Phase 3.8)
+## Audit logging
 
 The gateway always knows *what* happened (metrics) and *how it
 happened* (logs/traces). Audit logging adds a third stream tuned for
@@ -427,12 +427,12 @@ if your traffic is sensitive to a stuck-pod tail.
 ## Graceful shutdown
 
 When the gateway pod gets SIGTERM (Helm rolling upgrade, K8s pod
-eviction, scale-down), it does a two-phase drain:
+eviction, scale-down), it does a two-step drain:
 
-1. **Phase 1 — readiness flips off.** `/readyz` starts returning
+1. **Step 1 — readiness flips off.** `/readyz` starts returning
    503; the K8s Service controller removes the pod from its
    Endpoints within ~5s. New client traffic stops landing.
-2. **Phase 2 — wait for in-flight streams.** The gateway polls
+2. **Step 2 — wait for in-flight streams.** The gateway polls
    `scg_active_streams`. As long as ExecutePlan / ReattachExecute
    / AddArtifacts streams are still flowing, the gRPC server stays
    up. When `active_streams == 0` *or* `shutdown.deadlineSecs`

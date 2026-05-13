@@ -334,8 +334,9 @@ the tenant resolver. Immediately after, `scg_auth_failures_total`
 spikes and clients see `Status::Unauthenticated`, even though their
 tokens haven't changed and `auth.type` looks correct.
 
-**Why:** The Phase-3 tenant resolver added a second place where
-`Unauthenticated` can come from. Two policies trigger it:
+**Why:** The tenant resolver is a second place where
+`Unauthenticated` can come from (besides auth itself). Two policies
+trigger it:
 
 | Cause | Symptom in logs |
 |---|---|
@@ -409,8 +410,9 @@ tenants your IdP will produce.
 `Status::ResourceExhausted` with messages like `tenant "X" rate
 limit exceeded` or `user "Y" rate limit exceeded (tenant "X")`.
 
-**Why:** Per-tenant rate limiting (Phase 3.6) is enabled and the
-client's RPC rate is above the configured bucket. Either:
+**Why:** Per-tenant rate limiting is enabled (`rateLimit.enabled:
+true`) and the client's RPC rate is above the configured bucket.
+Either:
 
 * The limit is reasonable but the client is genuinely runaway.
 * The limit is too tight for normal workload.

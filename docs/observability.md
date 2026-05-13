@@ -99,7 +99,7 @@ self-heals — it'll refresh on the next call after the floor expires.
 
 ### `scg_rate_limit_rejected_total{tenant, scope}` — counter
 
-RPCs rejected by the per-tenant rate limiter (Phase 3.6). `scope`
+RPCs rejected by the per-tenant rate limiter. `scope`
 is `"tenant"` or `"user"` depending on which bucket emptied first.
 `tenant` cardinality is bounded by the configured tenant set —
 `overrides` keys plus the literal `default` for fall-through
@@ -123,7 +123,7 @@ is running away). Bump `rateLimit.overrides.<tenant>` in
 
 ### `scg_rate_limit_redis_errors_total{tenant, reason}` — counter
 
-Backend errors from the Redis-backed rate limiter (Phase 3.7).
+Backend errors from the Redis-backed rate limiter.
 Counts *errors*, not rejects: a fail-open deployment increments
 this without firing `scg_rate_limit_rejected_total`. `reason` is
 one of `tenant_bucket` or `user_bucket`. Only ever nonzero when
@@ -354,8 +354,9 @@ What this means in practice:
   gateway → backend hop will be visible in logs and metrics but the
   span won't appear in the trace UI.
 
-This is tracked as a known issue from Phase 2.13. The structured
-log line is the authoritative record for now.
+This is a known limitation upstream in `tracing-opentelemetry` ↔
+`opentelemetry_sdk` — see the README's "Known gaps" note. The
+structured log line is the authoritative record for now.
 
 ## What "normal" looks like
 
