@@ -378,8 +378,6 @@ deploy/examples/
   spark-connect-server/  # K8s manifests (apache/spark-kubernetes-operator)
 test/integration/
   README.md, client_smoke.py  # real PySpark E2E
-archive/go-phase1/
-  …              # original Go MVP, kept as design reference
 ```
 
 ## Regenerating proto bindings

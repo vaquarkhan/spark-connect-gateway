@@ -1,8 +1,0 @@
-# Address the gateway will bind to. Default :15003.
-bind_addr: ":15003"
-
-# Static list of Spark Connect server backends. Phase 1 only — Phase 2 adds
-# dynamic K8s service-watch and Consul backed pools.
-backends:
-  - "spark-connect-1.svc.cluster.local:15002"
-  - "spark-connect-2.svc.cluster.local:15002"
