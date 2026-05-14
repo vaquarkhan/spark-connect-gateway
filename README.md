@@ -444,9 +444,14 @@ your internal documentation.
 
 ## License
 
-Apache 2.0 (planned). The vendored Spark Connect protos under
-`proto/spark/connect/` are themselves under the Apache 2.0 license held by
-the Apache Software Foundation.
+Licensed under the [Apache License, Version 2.0](LICENSE). The vendored
+Spark Connect protos under `proto/spark/connect/` are themselves under
+the Apache 2.0 license held by the Apache Software Foundation; see
+[NOTICE](NOTICE) for details.
+
+Contributions are accepted under the same license — by submitting a
+pull request you agree that your contribution is licensed under
+Apache 2.0.
 
 [1]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [2]: ../plans/IMPLEMENTATION-PLAN-OSS-Spark-Connect-Gateway.md
