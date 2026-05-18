@@ -23,6 +23,13 @@
 //!
 //!   cargo run -p scg-proxy --example load --release -- \
 //!       drain-under-load --concurrency 100 --deadline-secs 10
+//!
+//!   cargo run -p scg-proxy --example load --release -- \
+//!       overhead --workers 32 --duration-secs 20
+//!
+//!   cargo run -p scg-proxy --example load --release -- \
+//!       redis-affinity --workers 32 --duration-secs 20 \
+//!       --redis-url redis://127.0.0.1:6379
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,19 +38,36 @@ use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use hdrhistogram::Histogram;
+use scg_audit::{AuditConfig, AuditLogger};
 use scg_auth::{AnonymousAuthenticator, AuthInterceptor};
 use scg_genproto::pb;
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
 use scg_observability::{Metrics, ReadinessProbe};
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
+use scg_ratelimit::{
+    BucketRate, LimiterObserver, MemoryLimiter, RateLimiter, RejectScope, TenantLimits,
+};
 use scg_routing::{AffinityStore, Pool, Router};
 use scg_store_memory::MemoryStore;
+use scg_store_redis::{RedisStore, RedisStoreConfig};
+use scg_tenant::{OnMissing, TenantResolver, TenantResolverConfig, TenantSource};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
+
+// ---------- Helpers ---------------------------------------------------------
+
+/// No-op limiter observer — the perf rig configures a generous
+/// bucket that never rejects, so we don't care about the on-reject
+/// signal. Matches the noop pattern in the in-memory limiter's own
+/// tests.
+struct NoopLimiterObs;
+impl LimiterObserver for NoopLimiterObs {
+    fn on_reject(&self, _tenant: &str, _scope: RejectScope) {}
+}
 
 // ---------- Fake backend ----------------------------------------------------
 
@@ -169,12 +193,31 @@ struct Rig {
     gw_kill: Option<oneshot::Sender<()>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RigOpts {
     n_backends: usize,
     stream_messages: usize,
     stream_delay_ms: u64,
     health_check: bool,
+    /// When `Some`, build a `TenantResolver` (always-default source)
+    /// and route every RPC through it. Measures the tenant-resolution
+    /// hot-path cost vs the baseline rig that uses `with_auth_and_metrics`
+    /// (no resolver wired in).
+    tenant_resolver: bool,
+    /// When `Some`, wire in a `MemoryLimiter` with a generous quota
+    /// (high enough that no test request gets throttled) so we can
+    /// measure the per-RPC bucket-check cost in isolation.
+    rate_limit: bool,
+    /// When `true`, attach an enabled `AuditLogger`. Every RPC fires
+    /// at least one tracing event; with `log_successful_rpcs=false`
+    /// the cost is dominated by the session.create event on the
+    /// binding path.
+    audit: bool,
+    /// When `Some(url)`, swap the in-process `MemoryStore` for a
+    /// `RedisStore` pointed at this URL. Measures the affinity-store
+    /// round-trip cost. The Redis must already be reachable; the
+    /// harness fails fast if connect errors.
+    affinity_redis_url: Option<String>,
 }
 
 impl Default for RigOpts {
@@ -184,6 +227,10 @@ impl Default for RigOpts {
             stream_messages: 100,
             stream_delay_ms: 0,
             health_check: false,
+            tenant_resolver: false,
+            rate_limit: false,
+            audit: false,
+            affinity_redis_url: None,
         }
     }
 }
@@ -231,15 +278,79 @@ async fn spawn_rig(opts: RigOpts) -> Rig {
     } else {
         inner
     };
-    let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
+    let store: Arc<dyn AffinityStore> = if let Some(url) = &opts.affinity_redis_url {
+        // Unique key prefix per rig so consecutive harness runs
+        // don't trip over each other: each run uses fresh backend
+        // ports, so stale bindings from a previous run would point
+        // at dead addresses.
+        let prefix = format!(
+            "scg-perf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let cfg = RedisStoreConfig {
+            url: url.clone(),
+            key_prefix: prefix,
+            ..Default::default()
+        };
+        Arc::new(
+            RedisStore::connect(cfg)
+                .await
+                .expect("connect to Redis affinity store"),
+        )
+    } else {
+        Arc::new(MemoryStore::new())
+    };
     let router = Arc::new(Router::single_pool(pool, store));
     let dialer = Dialer::new();
-    let proxy = SparkConnectProxy::with_auth_and_metrics(
-        router,
-        dialer,
-        AuthInterceptor::new(Arc::new(AnonymousAuthenticator)),
-        metrics.clone(),
-    );
+    let auth = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
+
+    // Decide between the back-compat constructor (matches the
+    // pre-Phase-3 perf baseline) and the full constructor. The
+    // full path runs through `authenticate_and_resolve` + tenant
+    // resolver + optional rate limit + optional audit, so each
+    // toggle has an additive overhead that the `overhead` scenario
+    // measures step by step.
+    let proxy = if opts.tenant_resolver || opts.rate_limit || opts.audit {
+        let tr = TenantResolver::new(TenantResolverConfig {
+            source: TenantSource::AlwaysDefault,
+            on_missing: OnMissing::UseDefault,
+            default_name: "default".into(),
+        });
+        let limiter = if opts.rate_limit {
+            // Generous quota — 1M rps, 1M burst — so the limiter
+            // never actually rejects. We only want to measure the
+            // bucket-check cost on the hot path.
+            let limits = TenantLimits {
+                tenant: BucketRate {
+                    rpcs_per_second: 1_000_000.0,
+                    burst: 1_000_000,
+                },
+                per_user: BucketRate::disabled(),
+            };
+            Some(RateLimiter::Memory(MemoryLimiter::new(
+                limits,
+                Default::default(),
+                Arc::new(NoopLimiterObs),
+            )))
+        } else {
+            None
+        };
+        let audit = if opts.audit {
+            AuditLogger::new(AuditConfig {
+                enabled: true,
+                log_successful_rpcs: false,
+            })
+        } else {
+            AuditLogger::disabled()
+        };
+        SparkConnectProxy::with_all(router, dialer, auth, metrics.clone(), tr, limiter, audit)
+    } else {
+        SparkConnectProxy::with_auth_and_metrics(router, dialer, auth, metrics.clone())
+    };
 
     let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = lis.local_addr().unwrap();
@@ -450,9 +561,18 @@ async fn scenario_hc_overhead(workers: usize, duration: Duration, n_sessions: us
         workers, duration
     );
     println!("  baseline (no HC):");
-    let baseline = run_unary_internal(workers, duration, n_sessions, false).await;
+    let baseline = run_unary_internal(workers, duration, n_sessions, RigOpts::default()).await;
     println!("  with HC:");
-    let with_hc = run_unary_internal(workers, duration, n_sessions, true).await;
+    let with_hc = run_unary_internal(
+        workers,
+        duration,
+        n_sessions,
+        RigOpts {
+            health_check: true,
+            ..RigOpts::default()
+        },
+    )
+    .await;
     println!("---");
     println!("[hc-overhead summary]");
     println!(
@@ -485,13 +605,9 @@ async fn run_unary_internal(
     workers: usize,
     duration: Duration,
     n_sessions: usize,
-    hc: bool,
+    opts: RigOpts,
 ) -> (Histogram<u64>, u64) {
-    let rig = spawn_rig(RigOpts {
-        health_check: hc,
-        ..RigOpts::default()
-    })
-    .await;
+    let rig = spawn_rig(opts).await;
     let stop_at = Instant::now() + duration;
     let total = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
@@ -543,6 +659,150 @@ async fn run_unary_internal(
     );
     drop(rig);
     (combined, total)
+}
+
+// ---------- Scenario 5: per-feature hot-path overhead -----------------------
+
+/// Walk through five rig configurations and report per-RPC overhead
+/// added by each multi-tenant feature stacked on top of the bare
+/// baseline. The bucket and the audit logger are configured so that
+/// they never reject and only emit on the binding path, respectively
+/// — the goal is to measure the *check* / *emit* cost on every RPC,
+/// not the cost of the work they protect against.
+async fn scenario_overhead(workers: usize, duration: Duration, n_sessions: usize) {
+    println!(
+        "[scenario] per-feature overhead: workers={} duration={:?} (each)",
+        workers, duration
+    );
+
+    let configs: &[(&str, RigOpts)] = &[
+        ("baseline (with_auth_and_metrics)", RigOpts::default()),
+        (
+            "+ tenant_resolver",
+            RigOpts {
+                tenant_resolver: true,
+                ..RigOpts::default()
+            },
+        ),
+        (
+            "+ tenant_resolver + rate_limit",
+            RigOpts {
+                tenant_resolver: true,
+                rate_limit: true,
+                ..RigOpts::default()
+            },
+        ),
+        (
+            "+ tenant_resolver + audit",
+            RigOpts {
+                tenant_resolver: true,
+                audit: true,
+                ..RigOpts::default()
+            },
+        ),
+        (
+            "+ all three",
+            RigOpts {
+                tenant_resolver: true,
+                rate_limit: true,
+                audit: true,
+                ..RigOpts::default()
+            },
+        ),
+    ];
+
+    let mut results: Vec<(String, Histogram<u64>, u64)> = Vec::with_capacity(configs.len());
+    for (label, opts) in configs {
+        println!("  {}:", label);
+        let (h, total) = run_unary_internal(workers, duration, n_sessions, opts.clone()).await;
+        results.push((label.to_string(), h, total));
+    }
+
+    println!("---");
+    println!("[overhead summary]");
+    let (_, baseline_h, baseline_total) = &results[0];
+    let baseline_p50 = baseline_h.value_at_quantile(0.50) as f64 / 1000.0;
+    let baseline_p99 = baseline_h.value_at_quantile(0.99) as f64 / 1000.0;
+    let baseline_qps = *baseline_total as f64 / duration.as_secs_f64();
+
+    println!(
+        "  {:38}  p50    p99    QPS      Δp50      Δp99      ΔQPS",
+        "config"
+    );
+    for (label, h, total) in &results {
+        let p50 = h.value_at_quantile(0.50) as f64 / 1000.0;
+        let p99 = h.value_at_quantile(0.99) as f64 / 1000.0;
+        let qps = *total as f64 / duration.as_secs_f64();
+        println!(
+            "  {:38} {:>5.3}  {:>5.3}  {:>6.0}   {:>+6.3}    {:>+6.3}    {:>+5.1}%",
+            label,
+            p50,
+            p99,
+            qps,
+            p50 - baseline_p50,
+            p99 - baseline_p99,
+            (qps - baseline_qps) / baseline_qps * 100.0,
+        );
+    }
+}
+
+// ---------- Scenario 6: Redis affinity store round-trip ---------------------
+
+/// Compare in-memory affinity store against a real Redis-backed one.
+/// Requires a Redis reachable at `--redis-url` (default
+/// redis://127.0.0.1:6379). Measures the extra round-trip cost of
+/// every lookup/bind hitting Redis.
+async fn scenario_redis_affinity(
+    workers: usize,
+    duration: Duration,
+    n_sessions: usize,
+    redis_url: String,
+) {
+    println!(
+        "[scenario] redis affinity store: workers={} duration={:?} url={}",
+        workers, duration, redis_url
+    );
+
+    println!("  baseline (memory affinity):");
+    let baseline = run_unary_internal(workers, duration, n_sessions, RigOpts::default()).await;
+    println!("  with Redis affinity:");
+    let with_redis = run_unary_internal(
+        workers,
+        duration,
+        n_sessions,
+        RigOpts {
+            affinity_redis_url: Some(redis_url),
+            ..RigOpts::default()
+        },
+    )
+    .await;
+
+    println!("---");
+    println!("[redis-affinity summary]");
+    let p50_b = baseline.0.value_at_quantile(0.50) as f64 / 1000.0;
+    let p99_b = baseline.0.value_at_quantile(0.99) as f64 / 1000.0;
+    let p50_r = with_redis.0.value_at_quantile(0.50) as f64 / 1000.0;
+    let p99_r = with_redis.0.value_at_quantile(0.99) as f64 / 1000.0;
+    let qps_b = baseline.1 as f64 / duration.as_secs_f64();
+    let qps_r = with_redis.1 as f64 / duration.as_secs_f64();
+    println!(
+        "  p50 (ms): memory={:.3}  redis={:.3}  delta={:+.3}",
+        p50_b,
+        p50_r,
+        p50_r - p50_b
+    );
+    println!(
+        "  p99 (ms): memory={:.3}  redis={:.3}  delta={:+.3}",
+        p99_b,
+        p99_r,
+        p99_r - p99_b
+    );
+    println!(
+        "  QPS: memory={:.0}  redis={:.0}  delta={:+.1}%",
+        qps_b,
+        qps_r,
+        (qps_r - qps_b) / qps_b * 100.0
+    );
 }
 
 // ---------- Scenario 4: drain under load -----------------------------------
@@ -695,6 +955,8 @@ async fn main() {
     let deadline_secs = parse_arg(&argv, "--deadline-secs", 10u64);
     let n_sessions = parse_arg(&argv, "--sessions", 64usize);
 
+    let redis_url = parse_arg::<String>(&argv, "--redis-url", "redis://127.0.0.1:6379".to_string());
+
     match scenario {
         "unary" => {
             scenario_unary(workers, Duration::from_secs(duration_secs), n_sessions).await;
@@ -708,9 +970,21 @@ async fn main() {
         "drain-under-load" => {
             scenario_drain_under_load(concurrency, messages, delay_ms, deadline_secs).await;
         }
+        "overhead" => {
+            scenario_overhead(workers, Duration::from_secs(duration_secs), n_sessions).await;
+        }
+        "redis-affinity" => {
+            scenario_redis_affinity(
+                workers,
+                Duration::from_secs(duration_secs),
+                n_sessions,
+                redis_url,
+            )
+            .await;
+        }
         other => {
             eprintln!(
-                "unknown scenario: {} — try one of: unary streaming hc-overhead drain-under-load",
+                "unknown scenario: {} — try one of: unary streaming hc-overhead drain-under-load overhead redis-affinity",
                 other
             );
             std::process::exit(2);
