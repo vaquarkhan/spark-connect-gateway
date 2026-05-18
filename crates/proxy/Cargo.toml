@@ -3,6 +3,12 @@ name = "scg-proxy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "gRPC SparkConnectService handler that forwards each RPC to a backend chosen by the router."
 publish = false
 
 [dependencies]

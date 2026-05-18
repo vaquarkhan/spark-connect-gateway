@@ -3,6 +3,12 @@ name = "scg-observability"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Prometheus metrics, OpenTelemetry tracing, and admin HTTP server for the Spark Connect Gateway."
 publish = false
 
 [dependencies]

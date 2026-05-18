@@ -21,8 +21,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Liang-Chi Hsieh <viirya@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/liangchi-hsieh/spark-connect-gateway"
+readme = "README.md"
+keywords = ["spark", "spark-connect", "gateway", "proxy", "grpc"]
+categories = ["network-programming", "database"]
+description = "Stateless gRPC proxy fronting Apache Spark Connect servers: session affinity, multi-tenant routing, auth, observability."
 publish = false
 rust-version = "1.82"
 

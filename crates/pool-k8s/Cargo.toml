@@ -3,6 +3,12 @@ name = "scg-pool-k8s"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Kubernetes Endpoints-watching backend pool for the Spark Connect Gateway."
 publish = false
 
 [dependencies]

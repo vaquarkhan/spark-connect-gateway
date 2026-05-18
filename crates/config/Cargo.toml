@@ -3,6 +3,12 @@ name = "scg-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "YAML configuration schema for the Spark Connect Gateway."
 publish = false
 
 [dependencies]
