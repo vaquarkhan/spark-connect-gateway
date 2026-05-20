@@ -30,9 +30,9 @@ pub mod token;
 pub use anonymous::AnonymousAuthenticator;
 pub use identity::Identity;
 pub use interceptor::AuthInterceptor;
-pub use jwt::JwtAuthenticator;
-pub use oidc::OidcAuthenticator;
-pub use token::StaticTokenAuthenticator;
+pub use jwt::{JwtAuthenticator, JwtConfig, JwtError, KeySource};
+pub use oidc::{OidcAuthenticator, OidcConfig, OidcError};
+pub use token::{StaticTokenAuthenticator, StaticTokenError, TokenEntry};
 
 use async_trait::async_trait;
 use tonic::metadata::MetadataMap;
