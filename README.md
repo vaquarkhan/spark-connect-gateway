@@ -319,9 +319,14 @@ For day-2 operations, see:
 
 ### Run on Kubernetes (auto-discovery)
 
-See [`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/)
-for sample manifests that stand up two Spark Connect servers via the upstream
-[`apache/spark-kubernetes-operator`][4].
+Want a complete end-to-end walkthrough? See
+[`deploy/examples/e2e-smoke/`](deploy/examples/e2e-smoke/) — kind
+cluster, Helm install, real Spark Connect servers, PySpark client
+through the gateway, verified session affinity and audit events.
+
+For production-style manifests using the upstream
+[`apache/spark-kubernetes-operator`][4], see
+[`deploy/examples/spark-connect-server/`](deploy/examples/spark-connect-server/).
 
 Once those servers (and a fronting `Service`) exist, point the gateway at the
 Service's `Endpoints` and let the gateway pick up backends automatically:

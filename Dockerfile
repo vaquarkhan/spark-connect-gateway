@@ -1,7 +1,7 @@
 FROM rust:1.82-slim AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    protobuf-compiler pkg-config libssl-dev && \
+    protobuf-compiler libprotobuf-dev pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --bin gateway
