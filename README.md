@@ -296,6 +296,10 @@ default for exactly that reason.
 
 For day-2 operations, see:
 
+* [`docs/architecture.md`](docs/architecture.md) — design overview
+  for people reading the code: layered crate structure, request
+  flow end-to-end, what each of the 15 crates does and why it's
+  its own crate, key design decisions, where to look first.
 * [`docs/deployment.md`](docs/deployment.md) — from-zero deployment
   runbook: prerequisites, install, hardening, upgrades, uninstall.
 * [`docs/multitenancy.md`](docs/multitenancy.md) — multi-tenant
