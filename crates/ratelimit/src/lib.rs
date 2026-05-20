@@ -65,7 +65,7 @@ impl BucketRate {
             burst: 0,
         }
     }
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.rpcs_per_second > 0.0 && self.burst > 0
     }
 }
@@ -116,9 +116,11 @@ pub trait LimiterObserver: Send + Sync + 'static {
     fn on_reject(&self, tenant: &str, scope: RejectScope);
 }
 
-/// No-op observer used when callers don't want metrics (tests,
-/// single-process examples).
-pub struct NoopObserver;
+/// No-op observer used by the in-crate unit tests. Production
+/// callers (gateway main) always wire a metrics-backed observer.
+#[cfg(test)]
+struct NoopObserver;
+#[cfg(test)]
 impl LimiterObserver for NoopObserver {
     fn on_reject(&self, _tenant: &str, _scope: RejectScope) {}
 }

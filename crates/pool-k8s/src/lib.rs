@@ -73,7 +73,12 @@ impl K8sPool {
         }
     }
 
-    /// Replace the backend list. Used by the watcher and by tests.
+    /// Replace the backend list. Used by the spawned watcher task
+    /// (in this crate) and by the in-crate integration tests.
+    /// Production callers never invoke this directly — it's an
+    /// internal seam exposed only because the integration-test
+    /// binary lives in a separate compilation unit.
+    #[doc(hidden)]
     pub fn set_backends(&self, addrs: Vec<String>) {
         let mut g = self.inner.backends.write();
         if *g != addrs {

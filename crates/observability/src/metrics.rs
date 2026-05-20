@@ -176,10 +176,10 @@ impl Metrics {
         }
     }
 
-    /// Convenience for code paths that observe a final gRPC code
-    /// without needing the duration timer (e.g. early auth rejection
-    /// after a guard-less code path).
-    pub fn record_rpc(&self, rpc: &'static str, code: &str) {
+    /// Bump `scg_rpcs_total{rpc, code}` directly. Called by the
+    /// `RpcGuard` Drop impl so the counter still reflects requests
+    /// where the handler returned early.
+    pub(crate) fn record_rpc(&self, rpc: &'static str, code: &str) {
         self.inner.rpcs_total.with_label_values(&[rpc, code]).inc();
     }
 

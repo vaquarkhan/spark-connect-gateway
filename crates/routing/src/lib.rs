@@ -63,7 +63,7 @@ impl SessionKey {
         }
     }
 
-    pub fn is_zero(&self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.session_id.is_empty()
     }
 }

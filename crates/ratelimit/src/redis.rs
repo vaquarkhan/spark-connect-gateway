@@ -72,7 +72,7 @@ use crate::{BucketRate, FailMode, LimiterObserver, RedisErrorObserver, RejectSco
 /// each `EVAL` is a single atomic operation — there is no "undo"
 /// for an admitted call. Callers that retry on transient network
 /// errors will *not* double-count rejections.
-pub const TOKEN_BUCKET_SCRIPT: &str = r#"
+pub(crate) const TOKEN_BUCKET_SCRIPT: &str = r#"
 local key      = KEYS[1]
 local rate     = tonumber(ARGV[1])
 local capacity = tonumber(ARGV[2])
