@@ -193,16 +193,6 @@ impl TenantRouter {
             ))),
         }
     }
-
-    /// Number of explicit tenants. Used by metrics / startup logs.
-    pub fn tenant_count(&self) -> usize {
-        self.tenants.len()
-    }
-
-    /// Whether a default pool is configured.
-    pub fn has_default(&self) -> bool {
-        self.default.is_some()
-    }
 }
 
 /// Outcome of a session-resolution call. `addr` is the backend

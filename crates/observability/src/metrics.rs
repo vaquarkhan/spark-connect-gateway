@@ -14,7 +14,6 @@
 //!   pipeline (Loki / Splunk), not in Prometheus.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use prometheus::{
     register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
@@ -174,7 +173,6 @@ impl Metrics {
             code: "Cancelled", // Replaced before drop unless caller bails early.
             recorded: false,
             _timer: timer,
-            started_at: Instant::now(),
         }
     }
 
@@ -236,7 +234,6 @@ pub struct RpcGuard {
     code: &'static str,
     recorded: bool,
     _timer: HistogramTimer,
-    started_at: Instant,
 }
 
 impl RpcGuard {
@@ -249,12 +246,6 @@ impl RpcGuard {
         }
         self.recorded = true;
         self.code = code;
-    }
-
-    /// Elapsed time since the guard was created. Useful in log lines
-    /// where you want both the metric and a per-request log.
-    pub fn elapsed(&self) -> std::time::Duration {
-        self.started_at.elapsed()
     }
 }
 

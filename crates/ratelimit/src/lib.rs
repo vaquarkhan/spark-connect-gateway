@@ -192,15 +192,6 @@ pub enum FailMode {
     Closed,
 }
 
-impl FailMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FailMode::Open => "open",
-            FailMode::Closed => "closed",
-        }
-    }
-}
-
 /// Public rate-limiter handle — an enum so the same proxy call site
 /// works for both backends. Cheap to clone (each variant is behind
 /// `Arc`).

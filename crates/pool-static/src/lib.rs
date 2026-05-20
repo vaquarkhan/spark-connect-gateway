@@ -31,10 +31,6 @@ impl StaticPool {
             cursor: AtomicU64::new(0),
         })
     }
-
-    pub fn all(&self) -> Vec<String> {
-        self.backends.clone()
-    }
 }
 
 impl Pool for StaticPool {

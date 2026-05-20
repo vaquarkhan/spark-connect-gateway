@@ -84,10 +84,6 @@ impl AuditLogger {
         })
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.cfg.enabled
-    }
-
     /// `session.create` — a `(tenant, user, session_id)` was bound
     /// to `backend` for the first time. Fires on the binding-path
     /// of the affinity store (not on every lookup).
