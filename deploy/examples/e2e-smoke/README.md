@@ -51,12 +51,15 @@ gateway image, kind node image).
 ## Step-by-step
 
 The directory you're reading lives at `deploy/examples/e2e-smoke/`.
-All `kubectl` / `helm` invocations below assume you're at the
-repo root.
+**Every command in this guide runs from the repo root**, not from
+this directory — the Dockerfile is at the repo root and its
+`COPY . .` build step expects to see the whole workspace
+(`crates/`, `Cargo.toml`, `proto/`).
 
 ### 1. Build the gateway image
 
 ```bash
+# from the repo root:
 docker build -t scg:e2e .
 ```
 
