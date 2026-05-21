@@ -329,6 +329,10 @@ End-to-end walkthroughs (each runs on a fresh kind cluster):
   scale the backend Deployment up and down at runtime; verify the
   K8s `Endpoints` watcher in `pool-k8s` picks up the changes
   without a gateway restart.
+* [`deploy/examples/e2e-multi-replica-redis/`](deploy/examples/e2e-multi-replica-redis/) —
+  two gateway replicas backed by the bundled Redis StatefulSet;
+  verify affinity bindings survive a gateway pod restart because
+  they live in Redis, not in pod memory.
 
 For production-style manifests using the upstream
 [`apache/spark-kubernetes-operator`][4], see

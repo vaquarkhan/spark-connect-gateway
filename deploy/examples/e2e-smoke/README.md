@@ -24,9 +24,10 @@ Docker cache (~30 minutes cold).
 
 ## What this does NOT exercise
 
-* Multi-replica gateway HA (use the in-process `ha_smoke.rs` example
-  instead — kind nodes are heavy enough that 2 gateway + 2 Spark
-  Connect server replicas push the laptop hard).
+* Multi-replica gateway HA with shared affinity — see the
+  [`e2e-multi-replica-redis`](../e2e-multi-replica-redis/) walkthrough
+  for that, or the in-process `ha_smoke.rs` example for the unit-test
+  flavour.
 * Auth (the smoke test uses `auth.type: none` so PySpark doesn't
   need a token).
 * Multi-tenancy (single-tenant deployment).
