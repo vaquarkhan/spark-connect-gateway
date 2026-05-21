@@ -319,16 +319,101 @@ fn wrap_with_healthcheck(inner: Arc<dyn Pool>, cfg: &HealthCheckSettings) -> Arc
     wrapper
 }
 
+/// Retry a Redis connect closure for up to `STARTUP_REDIS_RETRY_BUDGET`
+/// with a fixed `STARTUP_REDIS_RETRY_INTERVAL` between attempts.
+///
+/// In a Kubernetes start-from-scratch (Helm install / namespace
+/// rebuild) the gateway pod can reach `Running` before the Redis
+/// StatefulSet's PVC has bound, so the first connect attempt sees
+/// `Connection refused`. Without a retry, the gateway exits, the
+/// Deployment controller restarts it, but K8s applies exponential
+/// crashloop backoff — gateway can sit idle for minutes after Redis
+/// is actually ready. A bounded in-process retry sidesteps the
+/// backoff and gives a clean "Redis was slow to start" experience.
+///
+/// The budget is short enough that a real misconfiguration (wrong
+/// URL, network policy blocking the port) still surfaces quickly;
+/// the operator sees `connect failed after N retries: ...` and can
+/// fix the config without waiting on K8s backoff.
+const STARTUP_REDIS_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const STARTUP_REDIS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn retry_redis_connect<F, Fut, T, E>(target: &str, connect: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    retry_with_budget(
+        target,
+        STARTUP_REDIS_RETRY_BUDGET,
+        STARTUP_REDIS_RETRY_INTERVAL,
+        connect,
+    )
+    .await
+}
+
+/// Budget-parameterised core of [`retry_redis_connect`]. Pulled out
+/// so the unit tests can use a short budget instead of sleeping
+/// 60 seconds.
+async fn retry_with_budget<F, Fut, T, E>(
+    target: &str,
+    budget: std::time::Duration,
+    interval: std::time::Duration,
+    mut connect: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let deadline = std::time::Instant::now() + budget;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match connect().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    info!(target = %target, attempts = attempt, "redis connect succeeded after retry");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "connecting to {} failed after {} attempts ({:.0}s): {}",
+                        target,
+                        attempt,
+                        budget.as_secs_f64(),
+                        e
+                    ));
+                }
+                warn!(
+                    target = %target,
+                    attempt,
+                    error = %e,
+                    "redis connect failed; retrying"
+                );
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
 /// Build the configured `AffinityStore`. Memory is in-process and
 /// always succeeds; Redis dials the URL eagerly so misconfiguration
-/// surfaces at startup, not at the first inbound RPC.
+/// surfaces at startup, not at the first inbound RPC. The connect
+/// is retried for `STARTUP_REDIS_RETRY_BUDGET` so a slow-to-start
+/// Redis (cluster cold start, PVC still binding) doesn't crashloop
+/// the gateway.
 async fn build_affinity_store(cfg: &AffinityStoreConfig) -> Result<Arc<dyn AffinityStore>> {
     match cfg {
         AffinityStoreConfig::Memory => Ok(Arc::new(MemoryStore::new())),
         AffinityStoreConfig::Redis(s) => {
-            let store = RedisStore::connect(redis_store_config(s))
-                .await
-                .with_context(|| format!("connecting to redis at {}", s.url))?;
+            let target = format!("affinity-store redis at {}", s.url);
+            let store =
+                retry_redis_connect(&target, || RedisStore::connect(redis_store_config(s))).await?;
             Ok(Arc::new(store))
         }
     }
@@ -420,9 +505,17 @@ async fn build_rate_limiter(
                 metrics: metrics.clone(),
             });
             let redis_cfg = rate_limit_redis_config(&cfg.redis);
-            let limiter = RedisLimiter::connect(redis_cfg, default, overrides, observer, redis_obs)
-                .await
-                .with_context(|| format!("connecting rate-limit redis at {}", cfg.redis.url,))?;
+            let target = format!("rate-limit redis at {}", cfg.redis.url);
+            let limiter = retry_redis_connect(&target, || {
+                RedisLimiter::connect(
+                    redis_cfg.clone(),
+                    default,
+                    overrides.clone(),
+                    observer.clone(),
+                    redis_obs.clone(),
+                )
+            })
+            .await?;
             Ok(Some(RateLimiter::Redis(limiter)))
         }
     }
@@ -647,5 +740,90 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = int.recv() => info!("SIGINT received"),
         _ = term.recv() => info!("SIGTERM received"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn retry_returns_ok_on_first_attempt() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let result: Result<u32> = retry_with_budget(
+            "test",
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            || {
+                let a = a.clone();
+                async move {
+                    a.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, &str>(42)
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_after_transient_failures() {
+        // Fail twice, succeed on the third try — the realistic
+        // "Redis pod is still ContainerCreating" shape.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let result: Result<u32> = retry_with_budget(
+            "test",
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || {
+                let a = a.clone();
+                async move {
+                    let n = a.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n < 3 {
+                        Err("connection refused")
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_budget_exhausted() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let result: Result<u32> = retry_with_budget(
+            "redis at redis://does-not-exist:6379",
+            // Very short budget so the test is fast — the retry loop
+            // hits the deadline after one or two failed attempts.
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+            || {
+                let a = a.clone();
+                async move {
+                    a.fetch_add(1, Ordering::Relaxed);
+                    Err::<u32, _>("connection refused")
+                }
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        // Error message must name the target (so operators can see
+        // *which* Redis URL was unreachable) and the attempt count
+        // (so they can tell whether retries actually happened).
+        assert!(msg.contains("redis://does-not-exist:6379"), "got: {msg}");
+        assert!(msg.contains("attempts"), "got: {msg}");
+        assert!(attempts.load(Ordering::Relaxed) >= 1);
     }
 }

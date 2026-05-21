@@ -321,12 +321,29 @@ A line containing `connecting rate-limit redis at …` or similar
 identifies which URL the gateway dialed. It should match
 `redis://scg-redis:6379` (the chart's synthesized URL).
 
-### Gateway restart loops with `connecting rate-limit redis: …`
+### Gateway log shows `redis connect failed; retrying` during startup
 
-The gateway can't reach Redis at startup. The Redis pod usually
-becomes Ready before the gateway pods need it, but if the Redis
-StatefulSet's PVC took a while to bind, the gateway may have
-started first. Either delete the gateway pods so they restart and
-pick up the now-running Redis, or wait — the Deployment
-controller's restart backoff handles this within a couple of
-minutes.
+Expected on cold cluster boot. The gateway and Redis pods come up
+in parallel, and the gateway often reaches its `RedisStore::connect`
+step before the Redis pod is `Ready`. Look for log lines like:
+
+```
+{"level":"WARN", "message":"redis connect failed; retrying",
+ "target":"affinity-store redis at redis://scg-redis:6379",
+ "attempt":1, "error":"... Connection refused ..."}
+```
+
+The gateway retries every 2 seconds for up to 60 seconds, then
+gives up. A 2-3 attempt run during cold cluster boot is normal;
+look for a follow-up `redis connect succeeded after retry` line.
+
+If the gateway exits with `connecting to ... failed after N
+attempts`, it tried for the full 60 seconds without success —
+that's a real misconfiguration (wrong Redis URL, NetworkPolicy
+blocking the port, Redis pod failing to start). Check the Redis
+pod first:
+
+```bash
+kubectl get pods -n spark-connect scg-redis-0
+kubectl describe pod -n spark-connect scg-redis-0
+```
