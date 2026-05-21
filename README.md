@@ -319,10 +319,16 @@ For day-2 operations, see:
 
 ### Run on Kubernetes (auto-discovery)
 
-Want a complete end-to-end walkthrough? See
-[`deploy/examples/e2e-smoke/`](deploy/examples/e2e-smoke/) — kind
-cluster, Helm install, real Spark Connect servers, PySpark client
-through the gateway, verified session affinity and audit events.
+End-to-end walkthroughs (each runs on a fresh kind cluster):
+
+* [`deploy/examples/e2e-smoke/`](deploy/examples/e2e-smoke/) —
+  Helm install, real Spark Connect servers, PySpark client through
+  the gateway. Verifies session affinity and audit events. Start
+  here.
+* [`deploy/examples/e2e-scale-test/`](deploy/examples/e2e-scale-test/) —
+  scale the backend Deployment up and down at runtime; verify the
+  K8s `Endpoints` watcher in `pool-k8s` picks up the changes
+  without a gateway restart.
 
 For production-style manifests using the upstream
 [`apache/spark-kubernetes-operator`][4], see
