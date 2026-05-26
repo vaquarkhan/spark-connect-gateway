@@ -50,11 +50,23 @@ pub enum K8sPoolError {
     Client(#[from] kube::Error),
 }
 
+/// Callback invoked with the new backend count whenever the pool's
+/// membership changes. Used by the gateway binary to keep the
+/// `scg_backend_pool_size` Prometheus gauge in sync with the live
+/// pool — otherwise the gauge would freeze at its startup value (0
+/// for K8s discovery, since the watcher populates the pool
+/// asynchronously after `K8sPool::new`).
+///
+/// Defined as a `Fn(usize)` rather than a trait to keep this crate
+/// free of any dependency on `scg-observability`.
+pub type SizeObserver = Arc<dyn Fn(usize) + Send + Sync>;
+
 /// In-memory snapshot of the live backend list, plus a round-robin cursor.
 #[derive(Default)]
 struct Inner {
     backends: RwLock<Vec<String>>,
     cursor: AtomicU64,
+    size_observer: RwLock<Option<SizeObserver>>,
 }
 
 /// K8s service-watch backend pool. Cheap to clone: an `Arc` wraps the
@@ -73,6 +85,21 @@ impl K8sPool {
         }
     }
 
+    /// Register a callback that fires whenever the pool's backend list
+    /// changes (i.e. once per K8s Endpoints transition). The callback
+    /// runs synchronously inside `set_backends`, so it must be cheap
+    /// and non-blocking. Calling this replaces any previously registered
+    /// observer.
+    pub fn set_size_observer(&self, observer: SizeObserver) {
+        // Fire once on registration so the observer sees the current
+        // state — useful when a metric was already at a default before
+        // the pool was wired up, or when the watcher fired before the
+        // observer was attached.
+        let current_len = self.inner.backends.read().len();
+        observer(current_len);
+        *self.inner.size_observer.write() = Some(observer);
+    }
+
     /// Replace the backend list. Used by the spawned watcher task
     /// (in this crate) and by the in-crate integration tests.
     /// Production callers never invoke this directly — it's an
@@ -84,7 +111,14 @@ impl K8sPool {
         if *g != addrs {
             info!(count = addrs.len(), "k8s pool: backend list updated");
             debug!(?addrs, "k8s pool: new backends");
+            let new_len = addrs.len();
             *g = addrs;
+            // Drop the write lock before invoking the observer so a
+            // misbehaving observer can't deadlock the pool.
+            drop(g);
+            if let Some(obs) = self.inner.size_observer.read().as_ref() {
+                obs(new_len);
+            }
         }
     }
 
@@ -304,5 +338,42 @@ mod tests {
         assert_eq!(p.pick().as_deref(), Some("a"));
         p.set_backends(Vec::new());
         assert!(p.pick().is_none());
+    }
+
+    #[test]
+    fn size_observer_fires_on_each_membership_change() {
+        use std::sync::Mutex;
+
+        let p = K8sPool::new();
+        let log: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        p.set_size_observer(Arc::new(move |n| sink.lock().unwrap().push(n)));
+
+        // Registration alone fires once with the current (empty) size.
+        assert_eq!(*log.lock().unwrap(), vec![0]);
+
+        p.set_backends(vec!["a".into(), "b".into()]);
+        p.set_backends(vec!["a".into(), "b".into(), "c".into()]);
+        p.set_backends(vec!["a".into(), "b".into(), "c".into()]); // duplicate: no callback
+        p.set_backends(Vec::new());
+
+        assert_eq!(*log.lock().unwrap(), vec![0, 2, 3, 0]);
+    }
+
+    #[test]
+    fn size_observer_attached_after_first_update_sees_current_state() {
+        use std::sync::Mutex;
+
+        let p = K8sPool::new();
+        p.set_backends(vec!["a".into(), "b".into()]);
+
+        let log: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        p.set_size_observer(Arc::new(move |n| sink.lock().unwrap().push(n)));
+
+        // Late attach: observer is informed of the current size
+        // immediately so the downstream gauge isn't stuck at its prior
+        // value.
+        assert_eq!(*log.lock().unwrap(), vec![2]);
     }
 }

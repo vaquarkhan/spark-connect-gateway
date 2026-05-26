@@ -236,10 +236,17 @@ kubectl port-forward -n spark-connect svc/scg 9090:9090
 curl -s http://localhost:9090/metrics | grep "^scg_" | head
 ```
 
-The histogram bucket counts should match the number of RPCs your
-PySpark client issued (PySpark sends a handful of `Config` /
-`AnalyzePlan` calls per `getOrCreate`, then `ExecutePlan` per
-DataFrame operation).
+Two assertions worth eyeballing:
+
+* `scg_backend_pool_size 2` matches the two Spark Connect backends
+  the gateway discovered in step 5. If it reads `0`, the
+  K8s-watcher → metric wiring is broken: the gauge should follow
+  the same number that the `"backend list updated"` log line in
+  step 5 reported.
+* The `scg_rpc_duration_seconds_bucket` histogram bucket counts
+  should match the number of RPCs your PySpark client issued
+  (PySpark sends a handful of `Config` / `AnalyzePlan` calls per
+  `getOrCreate`, then `ExecutePlan` per DataFrame operation).
 
 ## Tearing down
 

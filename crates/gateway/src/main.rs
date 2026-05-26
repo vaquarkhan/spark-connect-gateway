@@ -195,15 +195,26 @@ async fn main() -> Result<()> {
 /// (K8s) the watcher task is spawned and its `JoinHandle` is returned
 /// so the caller can keep it alive for the lifetime of the server.
 ///
+/// If `size_observer` is `Some`, it is invoked with the live backend
+/// count on every membership change. For K8s discovery the observer
+/// is attached to the pool before any backend list is published, so
+/// the downstream gauge stays in sync with the watcher's view. For
+/// static discovery the observer is called exactly once with the
+/// configured list length, since the list is final at construction.
+///
 /// Returned tuple: (pool, optional watcher join-handle, initial pool
-/// size for metrics).
+/// size).
 async fn build_pool_from_discovery(
     discovery: &BackendDiscovery,
+    size_observer: Option<scg_pool_k8s::SizeObserver>,
 ) -> Result<(Arc<dyn Pool>, Option<tokio::task::JoinHandle<()>>, i64)> {
     match discovery {
         BackendDiscovery::Static { addresses } => {
             let size = addresses.len() as i64;
             let pool = StaticPool::new(addresses.clone()).context("building static pool")?;
+            if let Some(obs) = size_observer {
+                obs(addresses.len());
+            }
             Ok((Arc::new(pool), None, size))
         }
         BackendDiscovery::K8s {
@@ -212,6 +223,11 @@ async fn build_pool_from_discovery(
             port,
         } => {
             let pool = K8sPool::new();
+            // Attach the observer *before* the watcher starts publishing
+            // so the very first Endpoints event fires it.
+            if let Some(obs) = size_observer {
+                pool.set_size_observer(obs);
+            }
             let cfg = K8sPoolConfig {
                 namespace: namespace.clone(),
                 service_name: service_name.clone(),
@@ -249,11 +265,12 @@ async fn build_pool_from_discovery(
 /// when a tenant's pool happens to be empty (K8s discovery during
 /// startup).
 ///
-/// `metrics.set_backend_pool_size` is set to the *default* pool's
-/// size only — per-tenant gauges would need a `tenant` label and
-/// we deliberately keep `scg_backend_pool_size` unlabelled to
-/// bound cardinality. Per-tenant pool sizes show up in logs
-/// instead.
+/// `scg_backend_pool_size` tracks the *default* pool's live size
+/// only — per-tenant gauges would need a `tenant` label and we
+/// deliberately keep this metric unlabelled to bound cardinality.
+/// The gauge is wired to the default pool via a size observer so
+/// it stays in sync with the K8s watcher; per-tenant pool sizes
+/// show up in logs instead.
 async fn build_tenant_routing(
     cfg: &Config,
     metrics: &Metrics,
@@ -261,20 +278,30 @@ async fn build_tenant_routing(
 ) -> Result<(scg_routing::TenantRouter, Vec<tokio::task::JoinHandle<()>>)> {
     let mut watchers = Vec::new();
 
-    // Default pool from the existing discovery config.
+    // Default pool: attach a size observer that updates the
+    // `scg_backend_pool_size` gauge on every membership change. For
+    // K8s discovery the gauge starts at 0 and the observer fires
+    // once the watcher reports the first Endpoints object; for
+    // static discovery the observer fires once at construction with
+    // the configured list length.
+    let metrics_for_obs = metrics.clone();
+    let default_observer: scg_pool_k8s::SizeObserver =
+        Arc::new(move |n: usize| metrics_for_obs.set_backend_pool_size(n as i64));
+
     let (default_pool, default_watcher, default_size) =
-        build_pool_from_discovery(&cfg.discovery).await?;
+        build_pool_from_discovery(&cfg.discovery, Some(default_observer)).await?;
     if let Some(h) = default_watcher {
         watchers.push(h);
     }
-    metrics.set_backend_pool_size(default_size);
     let default_pool = wrap_with_healthcheck(default_pool, &cfg.health_check);
     info!(size = default_size, "default tenant pool ready");
 
-    // Per-tenant overrides.
+    // Per-tenant overrides. No metric observer attached — the
+    // unlabelled `scg_backend_pool_size` gauge intentionally tracks
+    // the default pool only.
     let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
     for (tenant, override_disc) in &cfg.tenant_pools.overrides {
-        let (pool, watcher, size) = build_pool_from_discovery(override_disc).await?;
+        let (pool, watcher, size) = build_pool_from_discovery(override_disc, None).await?;
         if let Some(h) = watcher {
             watchers.push(h);
         }
