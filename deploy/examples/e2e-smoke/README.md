@@ -18,6 +18,9 @@ Docker cache (~30 minutes cold).
 * Session affinity holding across multiple RPCs in one session
   (verified via Spark `TempView` survival — only works if every
   RPC reaches the same driver).
+* Round-robin routing across multiple backends, verified by
+  driving several PySpark sessions through the gateway and
+  checking the audit log lists both pod IPs as `backend` values.
 * Audit events emitted to the gateway's structured log stream
   (`session.create`, `session.release`, `rpc.error`).
 * Prometheus metrics emitted at the admin endpoint.
@@ -214,7 +217,59 @@ temp view count = 50
 temp view max   = 49
 ```
 
-### 7. Verify the audit log
+### 7. Drive multiple sessions; verify both backends get traffic
+
+The previous step opened a *single* `SparkSession`, which under
+session affinity binds to exactly one of the two backends. To
+prove the second backend is actually reachable through the
+gateway — not just discovered by the K8s watcher — open several
+sessions in a loop and check the audit log:
+
+```bash
+/tmp/scg-e2e-venv/bin/python3 - <<'PY'
+from pyspark.sql import SparkSession
+
+# Each iteration produces a fresh SparkSession with a new
+# session_id, so the gateway's round-robin picker assigns
+# successive sessions to different backends from the pool.
+for i in range(4):
+    spark = SparkSession.builder.remote("sc://localhost:15003").getOrCreate()
+    n = spark.range(10).count()
+    sid = spark.client._session_id
+    print(f"session {i}: count={n} session_id={sid}")
+    spark.stop()
+PY
+```
+
+Then inspect which backend each session bound to:
+
+```bash
+kubectl logs -n spark-connect deploy/scg --tail=500 \
+  | grep '"event":"session.create"' \
+  | /tmp/scg-e2e-venv/bin/python3 -c "
+import sys, json
+for line in sys.stdin:
+    f = json.loads(line).get('fields', {})
+    print(f.get('session_id', '?')[:8], '->', f.get('backend', '?'))
+"
+```
+
+Expected (exact session ids and pod IPs will differ; the
+**number of distinct `backend` values is what matters**):
+
+```
+4d2c702c -> 10.244.0.5:15002
+35636f1a -> 10.244.0.6:15002
+b6fd6df7 -> 10.244.0.5:15002
+e7f1cba9 -> 10.244.0.6:15002
+```
+
+Both pod IPs from `kubectl get endpoints spark-connect -n spark-connect`
+should appear at least once. If every line shows the same backend,
+the gateway is somehow funnelling all sessions to one pod — see the
+troubleshooting note at the bottom of this README.
+
+### 8. Verify the audit log
 
 ```bash
 kubectl logs -n spark-connect deploy/scg --tail=200 \
@@ -223,10 +278,11 @@ kubectl logs -n spark-connect deploy/scg --tail=200 \
 ```
 
 You should see one `session.create` event per `SparkSession` your
-script created, all with the same backend address per session,
-followed by `session.release` events.
+scripts created (one from step 6, four from step 7), all with the
+same backend address *within* a session, followed by
+`session.release` events as each `spark.stop()` ran.
 
-### 8. Verify the metrics endpoint
+### 9. Verify the metrics endpoint
 
 ```bash
 # In another new terminal:
@@ -294,6 +350,35 @@ kubectl get endpoints spark-connect -n spark-connect
 # NAME             ENDPOINTS                              AGE
 # spark-connect   10.244.0.10:15002,10.244.0.11:15002    2m
 ```
+
+### Step 7's multi-session run shows only one backend in the audit log
+
+Two common causes:
+
+1. **The pool only had one backend when the sessions ran.** Check
+   `scg_backend_pool_size` (step 9) and the `"backend list updated"`
+   log line — if either says `1`, the second Spark Connect pod was
+   not Ready during step 7. Re-run step 7 after both pods report
+   `READY 1/1` in `kubectl get pods -n spark-connect`.
+2. **The Python loop somehow reused the same session.** PySpark
+   caches the active `SparkSession` on the driver process, so
+   skipping `spark.stop()` between iterations makes `getOrCreate()`
+   return the *same* session — and therefore the same backend. The
+   sample in step 7 calls `spark.stop()` at the end of each iteration
+   for this reason; if you adapted the script, keep that call.
+
+Round-robin advances on every backend `pick()` — that includes
+the RPCs a single session sends, not just session creation. With
+two backends, whether successive *sessions* land on different
+backends therefore depends on how many RPCs each session
+internally drives the gateway to pick. PySpark's
+`getOrCreate` + `range(10).count()` happens to advance the
+cursor an odd number of times per session, so sessions
+alternate. If you adapt the script to do more work per session
+and end up always hitting one backend, that is a property of
+your workload, not a bug — increase the loop count or add a
+shorter "control" session that does one trivial RPC to confirm
+the second backend is reachable.
 
 ### PySpark client fails with `[PACKAGE_NOT_INSTALLED]`
 
