@@ -203,9 +203,15 @@ impl OidcAuthenticator {
         }
         match fetch_jwks(&self.http, &self.jwks_url).await {
             Ok(new_keys) => {
-                let mut g = self.cache.write();
-                g.keys = new_keys;
-                g.last_refreshed = Instant::now();
+                // Scope the write guard so it's dropped before the
+                // subsequent read — `parking_lot::RwLock` deadlocks
+                // if the same thread holds a write guard while
+                // attempting to acquire a read guard.
+                {
+                    let mut g = self.cache.write();
+                    g.keys = new_keys;
+                    g.last_refreshed = Instant::now();
+                }
                 drop(guard);
                 self.cache.read().keys.get(kid).cloned()
             }
@@ -365,5 +371,424 @@ fn parse_algorithm(name: &str) -> Result<Algorithm, OidcError> {
         "ES384" => Ok(Algorithm::ES384),
         "EDDSA" => Ok(Algorithm::EdDSA),
         other => Err(OidcError::UnknownAlg(other.into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! OIDC tests stand up a `wiremock` HTTP server that plays the role
+    //! of the identity provider, exposing a JWKS document (and
+    //! optionally an OIDC discovery document) backed by an RSA key
+    //! pair we generate per-test. Tokens are signed with the private
+    //! half using `jsonwebtoken`; the authenticator fetches the
+    //! public half over HTTP and verifies. The whole loop runs
+    //! in-process — no real IdP, no internet, no test fixtures on
+    //! disk.
+    //!
+    //! Key rotation is exercised by swapping the JWKS body the mock
+    //! server returns mid-test and driving a token signed under the
+    //! new key through the authenticator; the first miss triggers a
+    //! single re-fetch (subject to `refresh_floor_secs`) so the
+    //! refresh path is the one being measured, not the static cache.
+    use super::*;
+    use base64::Engine;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::traits::PublicKeyParts;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// One RSA key pair plus its JWKS representation. Lives across a
+    /// test so we can both sign tokens and serve the public half.
+    struct TestKey {
+        kid: String,
+        private_pem: String,
+        jwks_entry: serde_json::Value,
+    }
+
+    fn gen_key(kid: &str) -> TestKey {
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
+        let pub_key = RsaPublicKey::from(&priv_key);
+
+        let private_pem = priv_key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode private key as PEM")
+            .to_string();
+
+        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+        let jwks_entry = json!({
+            "kid": kid,
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "n": n,
+            "e": e,
+        });
+
+        TestKey {
+            kid: kid.into(),
+            private_pem,
+            jwks_entry,
+        }
+    }
+
+    fn jwks_body(keys: &[&TestKey]) -> serde_json::Value {
+        json!({
+            "keys": keys.iter().map(|k| k.jwks_entry.clone()).collect::<Vec<_>>()
+        })
+    }
+
+    fn future_exp() -> usize {
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600) as usize
+    }
+
+    fn past_exp() -> usize {
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600) as usize
+    }
+
+    fn sign(key: &TestKey, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(key.kid.clone());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Sign with a kid that doesn't match the encoded key — useful for
+    /// the "kid not in JWKS" path.
+    fn sign_with_kid(key: &TestKey, kid: &str, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn md(token: &str) -> MetadataMap {
+        let mut md = MetadataMap::new();
+        md.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        md
+    }
+
+    fn base_cfg(jwks_url: String) -> OidcConfig {
+        OidcConfig {
+            jwks_url: Some(jwks_url),
+            discovery_url: None,
+            algorithms: vec!["RS256".into()],
+            issuer: None,
+            audience: None,
+            user_id_claim: "sub".into(),
+            tenant_claim: Some("tenant".into()),
+            groups_claim: Some("groups".into()),
+            refresh_floor_secs: 0, // tests advance rotation explicitly
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_token_resolves_identity() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let auth = OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri())))
+            .await
+            .unwrap();
+        let token = sign(
+            &key,
+            json!({
+                "sub": "alice",
+                "exp": future_exp(),
+                "tenant": "team-a",
+                "groups": ["devs", "admins"],
+            }),
+        );
+        let id = auth.authenticate(&md(&token)).await.unwrap();
+        assert_eq!(id.user_id, "alice");
+        assert_eq!(id.tenant.as_deref(), Some("team-a"));
+        assert_eq!(id.groups, vec!["devs", "admins"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_url_resolves_jwks_uri() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        let jwks_uri = format!("{}/keys", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "jwks_uri": jwks_uri })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let mut cfg = base_cfg(String::new());
+        cfg.jwks_url = None;
+        cfg.discovery_url = Some(format!("{}/.well-known/openid-configuration", server.uri()));
+
+        let auth = OidcAuthenticator::new(cfg).await.unwrap();
+        let token = sign(&key, json!({ "sub": "alice", "exp": future_exp() }));
+        let id = auth.authenticate(&md(&token)).await.unwrap();
+        assert_eq!(id.user_id, "alice");
+    }
+
+    #[tokio::test]
+    async fn discovery_doc_missing_jwks_uri_is_clear_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issuer": "x" })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = base_cfg(String::new());
+        cfg.jwks_url = None;
+        cfg.discovery_url = Some(format!("{}/.well-known/openid-configuration", server.uri()));
+
+        let err = match OidcAuthenticator::new(cfg).await {
+            Ok(_) => panic!("expected DiscoveryMissingJwks error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, OidcError::DiscoveryMissingJwks { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_jwks_fetch_failure_propagates() {
+        // No mock mounted → wiremock returns 404 for every request.
+        let server = MockServer::start().await;
+        let err = match OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri()))).await {
+            Ok(_) => panic!("expected JwksParse or Http error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, OidcError::JwksParse { .. } | OidcError::Http { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let auth = OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri())))
+            .await
+            .unwrap();
+        let token = sign(&key, json!({ "sub": "alice", "exp": past_exp() }));
+        let err = auth.authenticate(&md(&token)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn issuer_mismatch_rejected() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let mut cfg = base_cfg(format!("{}/jwks", server.uri()));
+        cfg.issuer = Some("https://expected".into());
+
+        let auth = OidcAuthenticator::new(cfg).await.unwrap();
+        let token = sign(
+            &key,
+            json!({
+                "sub": "alice",
+                "exp": future_exp(),
+                "iss": "https://attacker",
+            }),
+        );
+        let err = auth.authenticate(&md(&token)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn audience_mismatch_rejected() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let mut cfg = base_cfg(format!("{}/jwks", server.uri()));
+        cfg.audience = Some("scg".into());
+
+        let auth = OidcAuthenticator::new(cfg).await.unwrap();
+        let token = sign(
+            &key,
+            json!({
+                "sub": "alice",
+                "exp": future_exp(),
+                "aud": "some-other-service",
+            }),
+        );
+        let err = auth.authenticate(&md(&token)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn missing_kid_in_header_rejected() {
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let auth = OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri())))
+            .await
+            .unwrap();
+        // Sign without setting header.kid.
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &json!({ "sub": "alice", "exp": future_exp() }),
+            &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let err = auth.authenticate(&md(&token)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_triggers_refresh_then_succeeds() {
+        // Initial JWKS has only key-1; mid-test we'll rotate so that
+        // key-2 appears. A token signed with key-2 should drive the
+        // authenticator into the unknown-kid refresh path and succeed
+        // on the retry.
+        let key_old = gen_key("key-1");
+        let key_new = gen_key("key-2");
+        let server = MockServer::start().await;
+
+        // First, only the old key is present.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key_old])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // After the first response is consumed, the rotated body is
+        // served. wiremock matches mocks in priority + insertion order
+        // so this one fires for subsequent GETs.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body(&[&key_old, &key_new])),
+            )
+            .mount(&server)
+            .await;
+
+        let auth = OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri())))
+            .await
+            .unwrap();
+        // Token signed under the new key, with the new key's kid.
+        let token = sign(&key_new, json!({ "sub": "bob", "exp": future_exp() }));
+        let id = auth.authenticate(&md(&token)).await.unwrap();
+        assert_eq!(id.user_id, "bob");
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_still_rejected_after_refresh_if_absent() {
+        // Even after a refresh, if the kid is not in the JWKS, reject.
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .mount(&server)
+            .await;
+
+        let auth = OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri())))
+            .await
+            .unwrap();
+        // Sign with key-1 bytes but claim kid=ghost.
+        let token = sign_with_kid(&key, "ghost", json!({ "sub": "x", "exp": future_exp() }));
+        let err = auth.authenticate(&md(&token)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn refresh_floor_blocks_repeated_misses() {
+        // With a non-zero refresh floor, a second unknown-kid attempt
+        // within the window must NOT hit the JWKS endpoint again.
+        let key = gen_key("key-1");
+        let server = MockServer::start().await;
+        // Expect at most ONE GET — the initial fetch. The refresh
+        // floor must suppress any miss-driven re-fetch within the
+        // window.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(&[&key])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = base_cfg(format!("{}/jwks", server.uri()));
+        cfg.refresh_floor_secs = 60;
+        let auth = OidcAuthenticator::new(cfg).await.unwrap();
+
+        // Two consecutive unknown-kid attempts.
+        let ghost_token = sign_with_kid(&key, "ghost", json!({ "sub": "x", "exp": future_exp() }));
+        let _ = auth.authenticate(&md(&ghost_token)).await;
+        let _ = auth.authenticate(&md(&ghost_token)).await;
+
+        // Mock's `.expect(1)` verifies on Drop that the endpoint was
+        // hit exactly once.
+    }
+
+    #[tokio::test]
+    async fn malformed_jwks_response_is_clear_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
+            .mount(&server)
+            .await;
+
+        let err = match OidcAuthenticator::new(base_cfg(format!("{}/jwks", server.uri()))).await {
+            Ok(_) => panic!("expected JwksParse error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, OidcError::JwksParse { .. }), "got: {err:?}");
     }
 }
