@@ -199,7 +199,13 @@ impl SparkConnectProxy {
     /// `scg_rate_limit_rejected_total{tenant, scope}`.
     ///
     /// `rid` and `rpc` are threaded through so auth-failure audit
-    /// events carry the correlation ID and the RPC name.
+    /// events carry the correlation ID and the RPC name. Tenant
+    /// resolution failures (configured-source yielded nothing and
+    /// `on_missing = Reject`) are treated as auth failures for
+    /// audit / metric purposes — the JWT may have been signed
+    /// correctly, but without a tenant the gateway can't route,
+    /// and the operational signal is the same as a bad token:
+    /// "this caller is not authorised to enter."
     async fn authenticate_and_resolve(
         &self,
         metadata: &MetadataMap,
@@ -207,7 +213,14 @@ impl SparkConnectProxy {
         rpc: &'static str,
     ) -> Result<(Arc<Identity>, String), Status> {
         let identity = self.authenticate(metadata, rid, rpc).await?;
-        let tenant = self.tenant_resolver.resolve(metadata, &identity)?;
+        let tenant = match self.tenant_resolver.resolve(metadata, &identity) {
+            Ok(t) => t,
+            Err(status) => {
+                self.metrics.record_auth_failure("missing_tenant");
+                self.audit.auth_failure(rid, rpc, "missing_tenant");
+                return Err(status);
+            }
+        };
         if let Some(limiter) = &self.rate_limiter {
             limiter.check(&tenant, &identity.user_id).await?;
         }

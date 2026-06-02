@@ -136,6 +136,17 @@ struct Rig {
 }
 
 async fn spawn_rig(auth: AuthInterceptor) -> Rig {
+    let resolver = TenantResolver::new(TenantResolverConfig {
+        source: TenantSource::FromMetadata {
+            header: "x-tenant".into(),
+        },
+        on_missing: OnMissing::UseDefault,
+        default_name: "default".into(),
+    });
+    spawn_rig_with_resolver(auth, resolver).await
+}
+
+async fn spawn_rig_with_resolver(auth: AuthInterceptor, resolver: TenantResolver) -> Rig {
     let be_lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let be_addr = be_lis.local_addr().unwrap().to_string();
     let (be_tx, be_rx) = tokio::sync::oneshot::channel();
@@ -157,13 +168,6 @@ async fn spawn_rig(auth: AuthInterceptor) -> Rig {
     let tr = TenantRouter::single(pool);
     let router = Arc::new(Router::new(tr, store));
     let dialer = Dialer::new();
-    let resolver = TenantResolver::new(TenantResolverConfig {
-        source: TenantSource::FromMetadata {
-            header: "x-tenant".into(),
-        },
-        on_missing: OnMissing::UseDefault,
-        default_name: "default".into(),
-    });
     let audit = AuditLogger::new(AuditConfig {
         enabled: true,
         log_successful_rpcs: false,
@@ -380,4 +384,60 @@ async fn rpc_error_emits_audit_event_with_code() {
         rpc_err.fields.get("code").map(|s| s.as_str()),
         Some("Internal")
     );
+}
+
+/// Auth succeeds (anonymous) but the tenant resolver is configured
+/// for `FromMetadata` + `Reject`, and the inbound RPC carries no
+/// `x-tenant` header. The proxy should reject with `Unauthenticated`
+/// AND emit a single `auth.failure` audit event with
+/// `reason=missing_tenant` — symmetric to how a missing bearer token
+/// emits `reason=missing_token`. Before #105 this rejection path
+/// produced only a `tracing::warn!` line and nothing on the audit
+/// pipeline.
+#[tokio::test]
+async fn missing_tenant_under_reject_emits_audit_event() {
+    let cap = AuditCapture::lease();
+    let resolver = TenantResolver::new(TenantResolverConfig {
+        source: TenantSource::FromMetadata {
+            header: "x-tenant".into(),
+        },
+        on_missing: OnMissing::Reject,
+        default_name: "default".into(),
+    });
+    let auth = AuthInterceptor::new(Arc::new(AnonymousAuthenticator));
+    let rig = spawn_rig_with_resolver(auth, resolver).await;
+    let mut c =
+        pb::spark_connect_service_client::SparkConnectServiceClient::new(rig.channel.clone());
+
+    // No x-tenant metadata → tenant_resolver rejects → Unauthenticated.
+    // Build a Config request without the helper (which would set
+    // x-tenant) so the resolver sees an empty MetadataMap.
+    let bare = Request::new(pb::ConfigRequest {
+        session_id: "sess-no-tenant".into(),
+        ..Default::default()
+    });
+    let err = c.config(bare).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(
+        err.message().contains("tenant"),
+        "expected tenant-resolution error, got: {}",
+        err.message()
+    );
+
+    // Exactly one auth.failure event with reason=missing_tenant.
+    assert_eq!(cap.count_events("auth.failure"), 1);
+    let auth_evt = cap.find_event("auth.failure").unwrap();
+    assert_eq!(
+        auth_evt.fields.get("reason").map(|s| s.as_str()),
+        Some("missing_tenant")
+    );
+    assert_eq!(
+        auth_evt.fields.get("rpc").map(|s| s.as_str()),
+        Some("Config")
+    );
+    // Pre-routing failure: no rpc.error follow-up (the auth.failure
+    // event already covers this RPC).
+    assert_eq!(cap.count_events("rpc.error"), 0);
+    // And no session.create, since we never reached the binding step.
+    assert_eq!(cap.count_events("session.create"), 0);
 }

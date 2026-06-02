@@ -185,7 +185,7 @@ impl Metrics {
 
     /// Bump the auth-failures counter. `reason` should be a small
     /// closed set: "missing_token", "invalid_token", "expired",
-    /// "unknown_kid", "unknown".
+    /// "unknown_kid", "missing_tenant", "unknown".
     pub fn record_auth_failure(&self, reason: &'static str) {
         self.inner
             .auth_failures_total

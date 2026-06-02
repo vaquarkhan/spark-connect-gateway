@@ -329,8 +329,34 @@ behaviour.
 
 `rpc.error` captures the **unknown-tenant** case as a
 `PermissionDenied` event with the descriptive message. The
-**missing-tenant-claim** case (step 7's second test) does
-*not* show up here — see troubleshooting below.
+**missing-tenant-claim** case (step 7's second test) shows up as
+an `auth.failure` event with `reason=missing_tenant` instead —
+inspect it the same way as in
+[e2e-auth-jwt step 8](../e2e-auth-jwt/README.md#8-confirm-audit--metrics-counted-the-failures):
+
+```bash
+kubectl logs -n spark-connect deploy/scg --tail=400 \
+  | grep '"event":"auth.failure"' \
+  | /tmp/scg-e2e-venv/bin/python3 -c "
+import sys, json
+for line in sys.stdin:
+    f = json.loads(line).get('fields', {})
+    print('reason=' + f.get('reason','?'))
+" | sort | uniq -c
+```
+
+Expected:
+
+```
+  N reason=missing_tenant
+```
+
+And the matching metric:
+
+```bash
+curl -s http://localhost:9090/metrics | grep "^scg_auth_failures_total"
+# scg_auth_failures_total{reason="missing_tenant"} N
+```
 
 ## What you've proved
 
@@ -340,7 +366,7 @@ behaviour.
 | Per-tenant pool isolation is real | step 6: alice → team-a pod, bob → team-b pod |
 | `tenantResolver` reads JWT `tenant` claim | step 6: `tenant` field in audit log matches the JWT |
 | Unknown tenant is rejected and audited | step 7: `PermissionDenied`; step 8: `rpc.error` event |
-| Missing tenant claim is rejected | step 7: `Unauthenticated` (audit coverage caveat — see below) |
+| Missing tenant claim is rejected and audited | step 7: `Unauthenticated`; step 8: `auth.failure` with `reason=missing_tenant` |
 | RPC reaches the correct backend after routing | step 5: `count = 10` from each tenant |
 
 ## Tearing down
@@ -370,25 +396,21 @@ Tenant routing isn't taking effect. Check, in order:
    Inspect the gateway ConfigMap: `kubectl get configmap -n
    spark-connect scg -o jsonpath='{.data.config\.yaml}'`.
 
-### Missing-tenant-claim rejection produces no `auth.failure` / `rpc.error`
+### Missing-tenant-claim rejection: what to grep for
 
-This is a known audit coverage gap, not a bug. The
-`tenant_resolver` rejects with `Status::unauthenticated("tenant
-required but not provided")` and emits a `tracing::warn!` line
-(visible in `kubectl logs -n spark-connect deploy/scg`), but it
-does *not* call into the `AuditLogger`. Operators relying on the
-audit pipeline to flag misconfigured clients won't see these
-rejections.
-
-To find them, grep the gateway log for the WARN line directly:
+The proxy treats the resolver's reject as an auth failure for
+audit / metric purposes: a single `auth.failure` event with
+`reason=missing_tenant`, and a matching bump to
+`scg_auth_failures_total{reason="missing_tenant"}`. The
+correlation ID (`rid`) on the audit event matches the gateway's
+WARN log line:
 
 ```bash
 kubectl logs -n spark-connect deploy/scg | grep "tenant_resolver: rejecting"
 ```
 
-Fixing this — plumbing `AuditLogger` through the tenant
-resolver — is tracked as a separate task. For the walkthrough,
-the WARN line is the signal.
+so the same RPC can be pivoted across both views (audit pipeline
+for compliance / alerting, structured log for operator debugging).
 
 ### `scg_backend_pool_size` shows `1`, not `3`
 
