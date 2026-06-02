@@ -1,0 +1,85 @@
+# Helm values for the multi-tenant routing e2e walkthrough.
+#
+# Three things differ from e2e-smoke / e2e-auth-jwt:
+#   1. Two per-tenant pool overrides (`team-a` and `team-b`),
+#      each pointing at its own Service.
+#   2. `onUnknownTenant: reject` — strict SaaS-style isolation.
+#      Any RPC whose JWT claim is neither `team-a` nor `team-b`
+#      is rejected with PermissionDenied.
+#   3. JWT auth on (reusing the HMAC pattern from e2e-auth-jwt)
+#      because the tenant comes from the JWT's `tenant` claim.
+#
+# The default `backendDiscovery` below is still set even though
+# every tenant has an override, because the chart requires it for
+# the routing engine. With `onUnknownTenant: reject`, the default
+# pool is never actually picked — but the binary still wants a
+# value to construct.
+
+image:
+  repository: scg
+  tag: e2e
+  pullPolicy: Never
+
+replicaCount: 1
+
+# Default pool — set to one of the team Services so the chart's
+# required field is satisfied. Not used in practice because of
+# the reject policy below.
+backendDiscovery:
+  type: k8s
+  k8s:
+    namespace: spark-connect
+    serviceName: spark-connect-team-a
+    port: 15002
+
+affinityStore:
+  type: memory
+
+redis:
+  enabled: false
+
+# JWT auth — tenant is derived from the `tenant` claim (see
+# tenantResolver.source below).
+auth:
+  type: jwt
+  jwt:
+    algorithms: [HS256]
+    key:
+      kind: hmacSecret
+      secret: e2e-multitenant-walkthrough-secret-not-for-production
+    issuer: "scg-e2e-issuer"
+    audience: "scg"
+    userIdClaim: sub
+    tenantClaim: tenant
+    groupsClaim: groups
+
+# Per-tenant backend pools. The two team pools are completely
+# independent K8s watchers — `team-a` watches Service
+# `spark-connect-team-a`, `team-b` watches `spark-connect-team-b`.
+# A session bound to one tenant can never accidentally land on
+# the other tenant's pods.
+tenantPools:
+  onUnknownTenant: reject
+  overrides:
+    team-a:
+      type: k8s
+      namespace: spark-connect
+      serviceName: spark-connect-team-a
+      port: 15002
+    team-b:
+      type: k8s
+      namespace: spark-connect
+      serviceName: spark-connect-team-b
+      port: 15002
+
+# Resolve tenant from the JWT's `tenant` claim. With
+# onMissing=reject, any token without a `tenant` claim — even if
+# the signature is otherwise valid — is rejected.
+tenantResolver:
+  source: from_claim
+  onMissing: reject
+  defaultName: default
+
+audit:
+  enabled: true
+  logSuccessfulRpcs: false
