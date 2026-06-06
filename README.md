@@ -454,13 +454,6 @@ roadmap items. Distributed-trace continuity for inbound `traceparent`
 is limited by upstream `tracing-opentelemetry` ↔ `opentelemetry_sdk`
 plumbing; root-span traces work end-to-end.
 
-
-
-If `cargo` fails with TLS errors against `crates.io` or `index.crates.io`,
-the registry is blocked at the network level. Configure
-`~/.cargo/config.toml` to use the internal proxy as documented at
-your internal documentation.
-
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). The vendored
