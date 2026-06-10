@@ -449,10 +449,13 @@ Redis); separate values overlays for K8s discovery, JWT/OIDC auth,
 external Redis, tracing.
 
 **Known gaps.** Weighted backend selection per tenant, cold-start
-provisioning of new tenant pools, and per-tenant warm pools are
-roadmap items. Distributed-trace continuity for inbound `traceparent`
-is limited by upstream `tracing-opentelemetry` ↔ `opentelemetry_sdk`
-plumbing; root-span traces work end-to-end.
+provisioning of new tenant pools, per-tenant warm pools, and
+multi-cluster discovery are roadmap items — see
+[ROADMAP.md](ROADMAP.md) for the full list with current status,
+planned shapes, and deliberate non-goals. Distributed-trace
+continuity for inbound `traceparent` is limited by upstream
+`tracing-opentelemetry` ↔ `opentelemetry_sdk` plumbing; root-span
+traces work end-to-end.
 
 ## License
 

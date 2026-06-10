@@ -389,7 +389,8 @@ covers this case under `two_replicas_share_the_bucket`.
 ## What's not here yet
 
 The gateway deliberately scopes itself to the **data plane**.
-Roadmap items not yet implemented:
+Tenant-related roadmap items, summarised (the project-wide list
+with planned shapes lives in [`ROADMAP.md`](../ROADMAP.md)):
 
 * **Weighted backend selection per tenant** — every tenant pool
   currently uses round-robin / pool-internal load distribution.
