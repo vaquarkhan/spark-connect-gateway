@@ -327,6 +327,19 @@ impl Router {
         self.store.bind_op(op_id, backend).await;
     }
 
+    /// Bind an explicit session key to a backend. Used by `CloneSession`:
+    /// the server creates a new session (`new_session_id`) on the same
+    /// backend as the parent, and without recording that binding the
+    /// cloned session would be re-picked by the pool on its next RPC and
+    /// miss its driver. No-op for an empty session id, matching
+    /// `remember_op`.
+    pub async fn remember_session(&self, key: SessionKey, backend: String) {
+        if key.is_zero() {
+            return;
+        }
+        self.store.bind_session_if_absent(key, backend).await;
+    }
+
     pub async fn forget_op(&self, op_id: &str) {
         if op_id.is_empty() {
             return;

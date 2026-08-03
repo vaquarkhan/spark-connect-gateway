@@ -722,7 +722,18 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
-            c.clone_session(outbound).await
+            let resp = c.clone_session(outbound).await?;
+            // Pin the newly cloned session to the same backend as its parent.
+            // CloneSession returns a fresh `new_session_id`; the client uses it
+            // for subsequent RPCs. Without recording this binding the next RPC
+            // would miss the affinity store and be round-robined onto a different
+            // backend, where the cloned session does not exist (SESSION_NOT_FOUND).
+            let new_sid = resp.get_ref().new_session_id.clone();
+            if !new_sid.is_empty() {
+                let new_key = SessionKey::with_tenant(&tenant, &identity.user_id, &new_sid);
+                self.router.remember_session(new_key, addr.clone()).await;
+            }
+            Ok(resp)
         }
         .instrument(span)
         .await;
