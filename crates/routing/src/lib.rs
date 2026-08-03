@@ -327,6 +327,27 @@ impl Router {
         self.store.bind_op(op_id, backend).await;
     }
 
+    /// Bind `key` to a *specific* backend, bypassing pool selection.
+    /// Used when the correct backend is dictated by protocol
+    /// semantics rather than placement policy — e.g. `CloneSession`
+    /// creates a new session whose state lives on the driver that
+    /// executed the clone, so the cloned session's key must be bound
+    /// to that same driver.
+    ///
+    /// Returns the winning binding: `backend` if this call bound the
+    /// key (or a racing call bound the same address), or the
+    /// pre-existing address if the key was already bound elsewhere.
+    /// A zero key (empty session id) is never bound and returns
+    /// `backend` unchanged.
+    pub async fn remember_session(&self, key: &SessionKey, backend: String) -> String {
+        if key.is_zero() {
+            return backend;
+        }
+        self.store
+            .bind_session_if_absent(key.clone(), backend)
+            .await
+    }
+
     pub async fn forget_op(&self, op_id: &str) {
         if op_id.is_empty() {
             return;
@@ -559,5 +580,45 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn remember_session_binds_fresh_key_to_given_backend() {
+        let r = router();
+        let k = SessionKey::new("u1", "cloned-1");
+        let winner = r.remember_session(&k, "b".into()).await;
+        assert_eq!(winner, "b");
+        // Follow-up resolution honours the explicit binding — it does
+        // NOT go through pool selection (SeqPool would have yielded
+        // "a" for a first pick).
+        assert_eq!(r.resolve_session(&k).await.unwrap().as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn remember_session_respects_existing_binding() {
+        let r = router();
+        let k = SessionKey::new("u1", "s1");
+        // Bind via normal resolution first (SeqPool starts at "a").
+        let placed = r.resolve_session(&k).await.unwrap().unwrap();
+        // An explicit remember to a different address loses the race:
+        // the pre-existing binding wins and is returned.
+        let winner = r.remember_session(&k, "z".into()).await;
+        assert_eq!(winner, placed);
+        assert_eq!(
+            r.resolve_session(&k).await.unwrap().as_deref(),
+            Some(placed.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_session_ignores_zero_key() {
+        let r = router();
+        let k = SessionKey::new("u1", "");
+        let winner = r.remember_session(&k, "b".into()).await;
+        assert_eq!(winner, "b");
+        // Zero keys are never bound; resolution still goes through
+        // pool selection.
+        let got = r.resolve_session(&k).await.unwrap();
+        assert_eq!(got.as_deref(), Some("a"));
     }
 }

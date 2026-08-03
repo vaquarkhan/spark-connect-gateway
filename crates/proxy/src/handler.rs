@@ -722,7 +722,41 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             stamp_propagation(&mut outbound, &rid);
-            c.clone_session(outbound).await
+            let resp = c.clone_session(outbound).await?;
+
+            // The cloned session's state lives on the driver that
+            // executed the clone. Bind the new session id to that same
+            // backend so follow-up RPCs route there instead of being
+            // placed on an arbitrary backend by pool selection.
+            let new_sid = resp.get_ref().new_session_id.clone();
+            if !new_sid.is_empty() {
+                let clone_key = key_from_identity(&tenant, &new_sid, &identity);
+                let winner = self.router.remember_session(&clone_key, addr.clone()).await;
+                if winner == addr {
+                    self.audit.session_create(
+                        &rid,
+                        &tenant,
+                        &identity.user_id,
+                        &identity.groups,
+                        &new_sid,
+                        &addr,
+                    );
+                } else {
+                    // A racing RPC already bound the cloned id to a
+                    // different backend — the clone's state is on
+                    // `addr` but routing will follow `winner`. Surface
+                    // loudly; the next RPC on the cloned session will
+                    // see single-server unknown-session semantics.
+                    warn!(
+                        rid = %rid,
+                        cloned_session = %new_sid,
+                        clone_backend = %addr,
+                        bound_backend = %winner,
+                        "CloneSession: cloned session id was already bound elsewhere"
+                    );
+                }
+            }
+            Ok(resp)
         }
         .instrument(span)
         .await;
