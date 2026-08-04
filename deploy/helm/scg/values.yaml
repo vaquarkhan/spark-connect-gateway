@@ -58,9 +58,17 @@ probes:
   initialDelaySeconds: 5
   periodSeconds: 10
 
-# -- Backend discovery. `static` is the default; switch to `k8s` to
-#    have the gateway watch a Spark Connect Service's Endpoints object
-#    (the apache/spark-kubernetes-operator pattern).
+# -- Backend discovery for the *default* pool. `static` is the
+#    default; switch to `k8s` to have the gateway watch a Spark
+#    Connect Service's Endpoints object (the
+#    apache/spark-kubernetes-operator pattern).
+#
+#    May be set to `null` — but only when
+#    `tenantPools.onUnknownTenant: reject` is set with at least one
+#    override: in that strict multi-tenant mode the default pool is
+#    never selected (unmatched tenants are rejected before pool
+#    selection), so no discovery source is needed. The chart and the
+#    gateway binary both validate this rule.
 backendDiscovery:
   # `static` or `k8s`
   type: static

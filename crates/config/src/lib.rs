@@ -42,7 +42,12 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
-    #[error("config: must specify either `backends` or `backend_discovery`")]
+    #[error(
+        "config: must specify either `backends` or `backend_discovery` \
+         (omitting both is allowed only when \
+         `tenant_pools.on_unknown_tenant: reject` is set and at least \
+         one tenant override is configured)"
+    )]
     NoDiscoverySource,
     #[error("config: cannot specify both `backends` and `backend_discovery`")]
     ConflictingDiscovery,
@@ -607,7 +612,13 @@ fn default_admin_addr_opt() -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
-    pub discovery: BackendDiscovery,
+    /// The default pool's discovery source. `None` is permitted only
+    /// under `tenant_pools.on_unknown_tenant: reject` with at least
+    /// one tenant override — in that mode the default pool is never
+    /// selected (unmatched tenants are rejected before pool
+    /// selection), so requiring a discovery source would force
+    /// operators to configure a pool that cannot receive traffic.
+    pub discovery: Option<BackendDiscovery>,
     pub auth: AuthConfig,
     /// `Some(addr)` to enable the admin HTTP server, `None` to skip it.
     pub admin_addr: Option<String>,
@@ -653,14 +664,28 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let tenant_pools = raw.tenant_pools.unwrap_or_default();
         let discovery = match (raw.backends, raw.backend_discovery) {
             (Some(_), Some(_)) => return Err(ConfigError::ConflictingDiscovery),
-            (None, None) => return Err(ConfigError::NoDiscoverySource),
+            (None, None) => {
+                // No default pool is acceptable only when routing can
+                // never select it: strict multi-tenant deployments
+                // where every admitted tenant has its own pool and
+                // everything else is rejected.
+                let strict = matches!(
+                    tenant_pools.on_unknown_tenant,
+                    UnknownTenantPolicySetting::Reject
+                ) && !tenant_pools.overrides.is_empty();
+                if !strict {
+                    return Err(ConfigError::NoDiscoverySource);
+                }
+                None
+            }
             (Some(addrs), None) => {
                 if addrs.is_empty() {
                     return Err(ConfigError::EmptyStatic);
                 }
-                BackendDiscovery::Static { addresses: addrs }
+                Some(BackendDiscovery::Static { addresses: addrs })
             }
             (None, Some(d)) => {
                 if let BackendDiscovery::Static { addresses } = &d {
@@ -668,7 +693,7 @@ impl Config {
                         return Err(ConfigError::EmptyStatic);
                     }
                 }
-                d
+                Some(d)
             }
         };
         let bind_addr = if raw.bind_addr.is_empty() {
@@ -686,7 +711,7 @@ impl Config {
             health_check: raw.health_check.unwrap_or_default(),
             shutdown: raw.shutdown.unwrap_or_default(),
             tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
-            tenant_pools: raw.tenant_pools.unwrap_or_default(),
+            tenant_pools,
             rate_limit: raw.rate_limit.unwrap_or_default(),
             audit: raw.audit.unwrap_or_default(),
         })
@@ -716,7 +741,7 @@ backends:
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.bind_addr, ":15003");
         match c.discovery {
-            BackendDiscovery::Static { addresses } => {
+            Some(BackendDiscovery::Static { addresses }) => {
                 assert_eq!(addresses, vec!["127.0.0.1:15002"]);
             }
             other => panic!("expected Static, got {:?}", other),
@@ -734,7 +759,7 @@ backend_discovery:
         );
         let c = Config::load(f.path()).unwrap();
         match c.discovery {
-            BackendDiscovery::Static { addresses } => {
+            Some(BackendDiscovery::Static { addresses }) => {
                 assert_eq!(addresses, vec!["a:1", "b:2"]);
             }
             other => panic!("expected Static, got {:?}", other),
@@ -754,17 +779,77 @@ backend_discovery:
         );
         let c = Config::load(f.path()).unwrap();
         match c.discovery {
-            BackendDiscovery::K8s {
+            Some(BackendDiscovery::K8s {
                 namespace,
                 service_name,
                 port,
-            } => {
+            }) => {
                 assert_eq!(namespace, "spark-connect");
                 assert_eq!(service_name, "spark-connect");
                 assert_eq!(port, 15002);
             }
             other => panic!("expected K8s, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn omitted_discovery_allowed_under_reject_with_overrides() {
+        // Strict multi-tenant mode: every admitted tenant has its own
+        // pool, unknown tenants are rejected — the default pool would
+        // never be selected, so requiring one would be dead config.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: reject
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a:15002"]
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.discovery.is_none());
+        assert!(matches!(
+            c.tenant_pools.on_unknown_tenant,
+            UnknownTenantPolicySetting::Reject
+        ));
+        assert_eq!(c.tenant_pools.overrides.len(), 1);
+    }
+
+    #[test]
+    fn omitted_discovery_rejected_under_use_default() {
+        // With use_default (explicit or implicit), the default pool
+        // is reachable, so a discovery source is mandatory.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: use_default
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a:15002"]
+"#,
+        );
+        assert!(matches!(
+            Config::load(f.path()).unwrap_err(),
+            ConfigError::NoDiscoverySource
+        ));
+    }
+
+    #[test]
+    fn omitted_discovery_rejected_without_overrides() {
+        // reject + zero overrides would reject every RPC — that's a
+        // config mistake, not a deployment shape; fail loudly.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: reject
+"#,
+        );
+        assert!(matches!(
+            Config::load(f.path()).unwrap_err(),
+            ConfigError::NoDiscoverySource
+        ));
     }
 
     #[test]

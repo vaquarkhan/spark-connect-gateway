@@ -9,7 +9,13 @@ data:
     bind_addr: ":{{ .Values.service.grpcPort }}"
     admin_addr: ":{{ .Values.service.adminPort }}"
 
-    {{- /* ---- backend discovery ---- */}}
+    {{- /* ---- backend discovery ----
+         backendDiscovery may be omitted (set to null) only when
+         tenantPools.onUnknownTenant is "reject" and at least one
+         tenant override is configured — in that mode the default
+         pool is never selected. The gateway binary enforces the
+         same rule at startup. */}}
+    {{- if .Values.backendDiscovery }}
     {{- if eq .Values.backendDiscovery.type "static" }}
     backends:
       {{- range .Values.backendDiscovery.static.addresses }}
@@ -23,6 +29,9 @@ data:
       port: {{ .Values.backendDiscovery.k8s.port }}
     {{- else }}
     {{- fail (printf "backendDiscovery.type must be 'static' or 'k8s', got %q" .Values.backendDiscovery.type) }}
+    {{- end }}
+    {{- else if not (and (eq .Values.tenantPools.onUnknownTenant "reject") .Values.tenantPools.overrides) }}
+    {{- fail "backendDiscovery may only be omitted when tenantPools.onUnknownTenant is \"reject\" and tenantPools.overrides is non-empty" }}
     {{- end }}
 
     {{- /* ---- auth ---- */}}

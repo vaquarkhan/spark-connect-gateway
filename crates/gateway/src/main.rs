@@ -288,13 +288,28 @@ async fn build_tenant_routing(
     let default_observer: scg_pool_k8s::SizeObserver =
         Arc::new(move |n: usize| metrics_for_obs.set_backend_pool_size(n as i64));
 
-    let (default_pool, default_watcher, default_size) =
-        build_pool_from_discovery(&cfg.discovery, Some(default_observer)).await?;
-    if let Some(h) = default_watcher {
-        watchers.push(h);
-    }
-    let default_pool = wrap_with_healthcheck(default_pool, &cfg.health_check);
-    info!(size = default_size, "default tenant pool ready");
+    // `discovery: None` is only accepted by config validation under
+    // `on_unknown_tenant: reject` with overrides present — routing
+    // can never select the default pool in that mode, so none is
+    // built. The unlabelled `scg_backend_pool_size` gauge (which
+    // tracks the default pool only) stays at 0.
+    let default_pool = match &cfg.discovery {
+        Some(discovery) => {
+            let (default_pool, default_watcher, default_size) =
+                build_pool_from_discovery(discovery, Some(default_observer)).await?;
+            if let Some(h) = default_watcher {
+                watchers.push(h);
+            }
+            let default_pool = wrap_with_healthcheck(default_pool, &cfg.health_check);
+            info!(size = default_size, "default tenant pool ready");
+            Some(default_pool)
+        }
+        None => {
+            metrics.set_backend_pool_size(0);
+            info!("no default pool configured (strict multi-tenant mode: per-tenant pools only)");
+            None
+        }
+    };
 
     // Per-tenant overrides. No metric observer attached — the
     // unlabelled `scg_backend_pool_size` gauge intentionally tracks
@@ -321,7 +336,7 @@ async fn build_tenant_routing(
         UnknownTenantPolicySetting::Reject => UnknownTenantPolicy::Reject,
     };
     Ok((
-        scg_routing::TenantRouter::new(tenants, Some(default_pool), policy),
+        scg_routing::TenantRouter::new(tenants, default_pool, policy),
         watchers,
     ))
 }
@@ -690,7 +705,7 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
     };
     let audit_enabled = cfg.audit.enabled;
     match &cfg.discovery {
-        BackendDiscovery::Static { addresses } => {
+        Some(BackendDiscovery::Static { addresses }) => {
             info!(
                 version,
                 %addr,
@@ -706,11 +721,11 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 "spark-connect-gateway starting"
             );
         }
-        BackendDiscovery::K8s {
+        Some(BackendDiscovery::K8s {
             namespace,
             service_name,
             port,
-        } => {
+        }) => {
             info!(
                 version,
                 %addr,
@@ -726,6 +741,21 @@ fn log_startup(cfg: &Config, addr: &std::net::SocketAddr) {
                 service = %service_name,
                 port,
                 "spark-connect-gateway starting (will populate backends from K8s Endpoints)"
+            );
+        }
+        None => {
+            info!(
+                version,
+                %addr,
+                discovery = "none",
+                auth = auth_kind,
+                affinity_store = store_kind,
+                tenant_source,
+                tenant_on_missing,
+                rate_limit = rate_limit_enabled,
+                rate_limit_store,
+                audit = audit_enabled,
+                "spark-connect-gateway starting (strict multi-tenant: per-tenant pools only, no default pool)"
             );
         }
     }
