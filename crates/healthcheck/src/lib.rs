@@ -24,12 +24,11 @@
 //! [gRPC Health Check Protocol]: https://github.com/grpc/grpc/blob/master/doc/health-checking.md
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use scg_routing::Pool;
+use scg_routing::{BackendMember, Pool};
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::ServingStatus;
@@ -87,18 +86,16 @@ impl BackendStatus {
     }
 }
 
-/// `Pool` adapter that filters its inner pool's `pick()` and
-/// `all_healthy()` by an actively-probed health view.
+/// `Pool` adapter that filters its inner pool's `members()` by an
+/// actively-probed health view. Placement over the filtered members
+/// stays with the selection strategy — this wrapper only decides who
+/// is a candidate at all.
 pub struct HealthAwarePool {
     inner: Arc<dyn Pool>,
     cfg: HealthCheckConfig,
     /// Map of `host:port` -> current health status. Backends that
     /// the inner pool no longer reports are GC'd on each probe round.
     statuses: RwLock<HashMap<String, BackendStatus>>,
-    /// Round-robin cursor over the currently-healthy slice. Separate
-    /// from the inner pool's cursor so eviction doesn't skew picks
-    /// across surviving backends.
-    cursor: AtomicU64,
 }
 
 impl HealthAwarePool {
@@ -111,7 +108,6 @@ impl HealthAwarePool {
             inner,
             cfg,
             statuses: RwLock::new(HashMap::new()),
-            cursor: AtomicU64::new(0),
         })
     }
 
@@ -136,7 +132,7 @@ impl HealthAwarePool {
     /// dial each in parallel, update each status entry, and GC
     /// backends the inner pool no longer knows about.
     async fn probe_all(&self) {
-        let backends = self.inner.all_healthy();
+        let backends: Vec<String> = self.inner.members().into_iter().map(|m| m.addr).collect();
         if backends.is_empty() {
             // Nothing to probe; clear the status map so a restart
             // doesn't carry over stale entries.
@@ -174,18 +170,18 @@ impl HealthAwarePool {
         }
     }
 
-    fn healthy_snapshot(&self) -> Vec<String> {
+    fn healthy_members(&self) -> Vec<BackendMember> {
         let g = self.statuses.read();
-        // If a backend is in `inner.all_healthy()` but not yet in our
+        // If a backend is in `inner.members()` but not yet in our
         // status map, treat it as healthy (default). This avoids a
         // gap on the first probe round where everything would look
         // unhealthy.
-        let inner = self.inner.all_healthy();
+        let inner = self.inner.members();
         let mut out = Vec::with_capacity(inner.len());
-        for addr in inner {
-            match g.get(&addr) {
+        for m in inner {
+            match g.get(&m.addr) {
                 Some(s) if s.state == HealthState::Unhealthy => continue,
-                _ => out.push(addr),
+                _ => out.push(m),
             }
         }
         out
@@ -193,17 +189,8 @@ impl HealthAwarePool {
 }
 
 impl Pool for HealthAwarePool {
-    fn pick(&self) -> Option<String> {
-        let healthy = self.healthy_snapshot();
-        if healthy.is_empty() {
-            return None;
-        }
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(healthy[(idx as usize) % healthy.len()].clone())
-    }
-
-    fn all_healthy(&self) -> Vec<String> {
-        self.healthy_snapshot()
+    fn members(&self) -> Vec<BackendMember> {
+        self.healthy_members()
     }
 
     fn mark_unhealthy(&self, addr: &str) {

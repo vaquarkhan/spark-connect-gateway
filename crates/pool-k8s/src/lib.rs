@@ -15,11 +15,11 @@
 //!   we need topology hints or 1000+-endpoint Services.
 //! * We only consider entries in `subset.addresses` (i.e. ready pods) and
 //!   skip `subset.not_ready_addresses`.
-//! * Internal state is a `Vec<String>` of `host:port` strings plus a
-//!   round-robin cursor. The watcher fully replaces the Vec on every
-//!   event, so we don't need fine-grained add/remove handling.
+//! * Internal state is a `Vec<String>` of `host:port` strings. The
+//!   watcher fully replaces the Vec on every event, so we don't need
+//!   fine-grained add/remove handling. Placement over the members is
+//!   the [`scg_routing::SelectionStrategy`]'s job, not the pool's.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::Endpoints;
 use kube::api::Api;
 use kube::runtime::watcher;
 use parking_lot::RwLock;
-use scg_routing::Pool;
+use scg_routing::{BackendMember, Pool};
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -61,11 +61,10 @@ pub enum K8sPoolError {
 /// free of any dependency on `scg-observability`.
 pub type SizeObserver = Arc<dyn Fn(usize) + Send + Sync>;
 
-/// In-memory snapshot of the live backend list, plus a round-robin cursor.
+/// In-memory snapshot of the live backend list.
 #[derive(Default)]
 struct Inner {
     backends: RwLock<Vec<String>>,
-    cursor: AtomicU64,
     size_observer: RwLock<Option<SizeObserver>>,
 }
 
@@ -173,17 +172,17 @@ impl Default for K8sPool {
 }
 
 impl Pool for K8sPool {
-    fn pick(&self) -> Option<String> {
-        let g = self.inner.backends.read();
-        if g.is_empty() {
-            return None;
-        }
-        let idx = self.inner.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(g[(idx as usize) % g.len()].clone())
-    }
-
-    fn all_healthy(&self) -> Vec<String> {
-        self.inner.backends.read().clone()
+    fn members(&self) -> Vec<BackendMember> {
+        // Addresses only for now — Endpoints objects don't carry pod
+        // labels, so surfacing metadata (e.g. spark-version) needs an
+        // additional Pod watch. Planned work; members get default
+        // labels/weight until then.
+        self.inner
+            .backends
+            .read()
+            .iter()
+            .map(BackendMember::new)
+            .collect()
     }
 
     fn mark_unhealthy(&self, addr: &str) {
@@ -293,51 +292,38 @@ mod tests {
         assert!(extract_addresses(&e, 15002).is_empty());
     }
 
+    fn addrs(p: &K8sPool) -> Vec<String> {
+        p.members().into_iter().map(|m| m.addr).collect()
+    }
+
     #[test]
-    fn pool_round_robins_over_current_backends() {
+    fn members_reflect_set_backends() {
         let p = K8sPool::new();
-        assert!(p.pick().is_none(), "empty pool returns None");
+        assert!(p.members().is_empty(), "fresh pool has no members");
         p.set_backends(vec!["a".into(), "b".into(), "c".into()]);
-
-        let got: Vec<_> = (0..4).filter_map(|_| p.pick()).collect();
-        assert_eq!(got, vec!["a", "b", "c", "a"]);
-
-        let mut healthy = p.all_healthy();
-        healthy.sort();
-        assert_eq!(healthy, vec!["a", "b", "c"]);
+        assert_eq!(addrs(&p), vec!["a", "b", "c"]);
+        assert!(p
+            .members()
+            .iter()
+            .all(|m| m.weight == 1 && m.labels.is_empty()));
     }
 
     #[test]
     fn pool_handles_membership_changes() {
         let p = K8sPool::new();
         p.set_backends(vec!["a".into(), "b".into()]);
-        assert_eq!(p.pick().as_deref(), Some("a"));
-
-        // Replace; cursor is shared so we keep advancing into the new
-        // list — not a correctness issue since pick() is `Option<String>`
-        // anyway, but worth pinning down via test.
+        assert_eq!(addrs(&p), vec!["a", "b"]);
         p.set_backends(vec!["x".into(), "y".into(), "z".into()]);
-        let got: Vec<_> = (0..3).filter_map(|_| p.pick()).collect();
-        // We don't assert exact ordering here because it depends on the
-        // cursor state; instead just check that all returned addrs are
-        // from the new set.
-        for g in &got {
-            assert!(
-                ["x", "y", "z"].contains(&g.as_str()),
-                "unexpected pick: {}",
-                g
-            );
-        }
-        assert_eq!(got.len(), 3);
+        assert_eq!(addrs(&p), vec!["x", "y", "z"]);
     }
 
     #[test]
-    fn pool_returns_none_after_drain() {
+    fn pool_empties_after_drain() {
         let p = K8sPool::new();
         p.set_backends(vec!["a".into()]);
-        assert_eq!(p.pick().as_deref(), Some("a"));
+        assert_eq!(addrs(&p), vec!["a"]);
         p.set_backends(Vec::new());
-        assert!(p.pick().is_none());
+        assert!(p.members().is_empty());
     }
 
     #[test]

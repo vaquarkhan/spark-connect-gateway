@@ -68,27 +68,109 @@ impl SessionKey {
     }
 }
 
-/// Selects backends. Implementations must be safe for concurrent use.
+/// One backend in a pool: an address plus the metadata a selection
+/// strategy may key on. Discovery sources fill what they know —
+/// static config can declare labels and weights explicitly; the K8s
+/// watcher currently supplies addresses only (pod-label surfacing is
+/// planned work).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendMember {
+    pub addr: String,
+    /// Free-form key/value metadata (e.g. `spark-version`), for
+    /// metadata-aware selection strategies. Empty unless the
+    /// discovery source provides it.
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Relative weight for weighted strategies. Defaults to 1;
+    /// round-robin ignores it.
+    pub weight: u32,
+}
+
+impl BackendMember {
+    /// A member with default metadata (no labels, weight 1).
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            labels: std::collections::BTreeMap::new(),
+            weight: 1,
+        }
+    }
+}
+
+/// Provides pool *membership*: which backends currently exist and
+/// are believed healthy. Implementations must be safe for concurrent
+/// use.
 ///
 /// Two shipping implementations: `scg-pool-static` (fixed list at
 /// startup) and `scg-pool-k8s` (Endpoints watch). The K8s pool can
-/// be empty during startup or after a flap, so `pick` returns
-/// `Option<String>`.
+/// be empty during startup or after a flap.
+///
+/// Deliberately *not* part of this trait: choosing which member a
+/// new session is placed on. That is [`SelectionStrategy`]'s job —
+/// membership sources and placement policies vary independently.
 pub trait Pool: Send + Sync + 'static {
-    /// Pick the next backend for a *new* session, or `None` if no healthy
-    /// backend is currently available. Must be safe for concurrent use;
-    /// implementations typically advance an internal cursor.
-    fn pick(&self) -> Option<String>;
-
-    /// Snapshot of currently-healthy backend addresses. Used by metrics
-    /// and admin endpoints. Order is implementation-defined.
-    fn all_healthy(&self) -> Vec<String>;
+    /// Snapshot of the currently-healthy members. Order is
+    /// implementation-defined; strategies must not rely on it beyond
+    /// a single call.
+    fn members(&self) -> Vec<BackendMember>;
 
     /// Best-effort hint that `addr` is unreachable. Implementations may
     /// remove `addr` from the rotation, decrement a health score, or
     /// ignore the hint entirely. The K8s pool uses this for passive
     /// failure detection alongside its active service-watch.
     fn mark_unhealthy(&self, _addr: &str) {}
+}
+
+/// Inputs a [`SelectionStrategy`] may consult beyond the candidate
+/// list itself. Empty today; declared `#[non_exhaustive]` so fields
+/// (e.g. per-backend session counts for least-sessions placement)
+/// can be added without breaking implementors.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct SelectionContext {}
+
+/// Chooses which pool member a *new* session is placed on. Invoked
+/// only on the placement path — affinity hits, the operation-id
+/// reverse index, and bind-if-absent race arbitration never consult
+/// the strategy, so a misbehaving strategy can skew new placements
+/// but cannot break live sessions.
+///
+/// Strategies may be stateful (round-robin holds a cursor); one
+/// strategy instance serves one pool, so state never mixes across
+/// tenants.
+pub trait SelectionStrategy: Send + Sync + 'static {
+    /// Return the index of the chosen candidate, or `None` to decline
+    /// (e.g. `candidates` is empty). Called with a consistent
+    /// snapshot; must be non-blocking.
+    fn select(
+        &self,
+        key: &SessionKey,
+        candidates: &[BackendMember],
+        ctx: &SelectionContext,
+    ) -> Option<usize>;
+}
+
+/// The default strategy: rotate over the candidates with an atomic
+/// cursor. Ignores labels, weights, and the session key.
+#[derive(Debug, Default)]
+pub struct RoundRobinStrategy {
+    cursor: std::sync::atomic::AtomicU64,
+}
+
+impl SelectionStrategy for RoundRobinStrategy {
+    fn select(
+        &self,
+        _key: &SessionKey,
+        candidates: &[BackendMember],
+        _ctx: &SelectionContext,
+    ) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some((idx % candidates.len() as u64) as usize)
+    }
 }
 
 /// Persistence layer for sticky routing decisions. Two shipping
@@ -127,24 +209,57 @@ pub enum UnknownTenantPolicy {
     Reject,
 }
 
-/// Maps a tenant string to a [`Pool`]. Construct once at startup
-/// from the operator's config. Cheap to clone (everything is `Arc`).
+/// A pool paired with the strategy that places new sessions on it.
+/// Membership and placement policy vary independently — the pairing
+/// happens here, one strategy instance per pool so strategy state
+/// (e.g. a round-robin cursor) never mixes across pools.
+#[derive(Clone)]
+pub struct PoolEntry {
+    pub pool: Arc<dyn Pool>,
+    pub strategy: Arc<dyn SelectionStrategy>,
+}
+
+impl PoolEntry {
+    /// Pair `pool` with the default round-robin strategy.
+    pub fn round_robin(pool: Arc<dyn Pool>) -> Self {
+        Self {
+            pool,
+            strategy: Arc::new(RoundRobinStrategy::default()),
+        }
+    }
+
+    /// Pair `pool` with an explicit strategy.
+    pub fn with_strategy(pool: Arc<dyn Pool>, strategy: Arc<dyn SelectionStrategy>) -> Self {
+        Self { pool, strategy }
+    }
+
+    /// Apply this entry's strategy to its pool's current members.
+    fn select_addr(&self, key: &SessionKey) -> Option<String> {
+        let members = self.pool.members();
+        let ctx = SelectionContext::default();
+        let idx = self.strategy.select(key, &members, &ctx)?;
+        members.get(idx).map(|m| m.addr.clone())
+    }
+}
+
+/// Maps a tenant string to a [`PoolEntry`]. Construct once at
+/// startup from the operator's config. Cheap to clone (everything
+/// is `Arc`).
 ///
 /// The lookup order is:
 ///
 /// 1. `tenants` map (exact match on tenant string).
-/// 2. `default` pool if `policy == UseDefault`.
+/// 2. `default` entry if `policy == UseDefault`.
 /// 3. `Err(PermissionDenied)` if `policy == Reject`.
-#[derive(Clone)]
 pub struct TenantRouter {
-    tenants: HashMap<String, Arc<dyn Pool>>,
-    default: Option<Arc<dyn Pool>>,
+    tenants: HashMap<String, PoolEntry>,
+    default: Option<PoolEntry>,
     policy: UnknownTenantPolicy,
 }
 
 impl TenantRouter {
-    /// Build a router from explicit per-tenant pools, an optional
-    /// shared default pool, and the unknown-tenant policy.
+    /// Build a router from explicit per-tenant pool entries, an
+    /// optional shared default entry, and the unknown-tenant policy.
     ///
     /// `default = None` + `policy = UseDefault` is allowed but
     /// degrades to "everything except the explicit tenants fails"
@@ -153,8 +268,8 @@ impl TenantRouter {
     /// `Unavailable` from the empty pool path). Set the policy
     /// explicitly if you want clean error semantics.
     pub fn new(
-        tenants: HashMap<String, Arc<dyn Pool>>,
-        default: Option<Arc<dyn Pool>>,
+        tenants: HashMap<String, PoolEntry>,
+        default: Option<PoolEntry>,
         policy: UnknownTenantPolicy,
     ) -> Self {
         Self {
@@ -164,24 +279,24 @@ impl TenantRouter {
         }
     }
 
-    /// Single-pool convenience: every tenant routes to the same pool.
-    /// Used by single-tenant deployments and by tests that don't care
-    /// about per-tenant isolation.
+    /// Single-pool convenience: every tenant routes to the same pool
+    /// with round-robin placement. Used by single-tenant deployments
+    /// and by tests that don't care about per-tenant isolation.
     pub fn single(pool: Arc<dyn Pool>) -> Self {
         Self {
             tenants: HashMap::new(),
-            default: Some(pool),
+            default: Some(PoolEntry::round_robin(pool)),
             policy: UnknownTenantPolicy::UseDefault,
         }
     }
 
-    /// Pick the pool for `tenant`. Returns:
-    /// * `Ok(Some(pool))` when a pool is available (explicit or default)
+    /// Pick the pool entry for `tenant`. Returns:
+    /// * `Ok(Some(entry))` when a pool is available (explicit or default)
     /// * `Ok(None)` when no pool exists and policy says it's OK (e.g.
     ///   `UseDefault` without a default pool — caller emits the usual
     ///   "no healthy backend" error)
     /// * `Err(Status)` when `policy == Reject` and the tenant is unknown.
-    pub fn pool_for(&self, tenant: &str) -> Result<Option<Arc<dyn Pool>>, Status> {
+    pub fn pool_for(&self, tenant: &str) -> Result<Option<PoolEntry>, Status> {
         if let Some(p) = self.tenants.get(tenant) {
             return Ok(Some(p.clone()));
         }
@@ -257,14 +372,14 @@ impl Router {
         &self,
         key: &SessionKey,
     ) -> Result<Option<ResolveOutcome>, Status> {
-        let Some(pool) = self.tenants.pool_for(&key.tenant)? else {
+        let Some(entry) = self.tenants.pool_for(&key.tenant)? else {
             return Ok(None);
         };
         if key.is_zero() {
             // Empty session_id is never bound — the affinity store
             // ignores it. Counts as `newly_bound = false` for audit
             // purposes (there's nothing to record).
-            return Ok(pool.pick().map(|addr| ResolveOutcome {
+            return Ok(entry.select_addr(key).map(|addr| ResolveOutcome {
                 addr,
                 newly_bound: false,
             }));
@@ -275,7 +390,7 @@ impl Router {
                 newly_bound: false,
             }));
         }
-        let Some(chosen) = pool.pick() else {
+        let Some(chosen) = entry.select_addr(key) else {
             return Ok(None);
         };
         let winner = self
@@ -315,8 +430,8 @@ impl Router {
     /// Hint that `addr` is currently unreachable. Routed to the pool
     /// owning `tenant`. Best-effort — unknown tenant is a no-op.
     pub fn mark_unhealthy(&self, tenant: &str, addr: &str) {
-        if let Ok(Some(pool)) = self.tenants.pool_for(tenant) {
-            pool.mark_unhealthy(addr);
+        if let Ok(Some(entry)) = self.tenants.pool_for(tenant) {
+            entry.pool.mark_unhealthy(addr);
         }
     }
 
@@ -365,18 +480,17 @@ mod tests {
     use super::*;
     use parking_lot::Mutex as PLMutex;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct SeqPool {
-        n: AtomicU64,
-    }
+    /// Fixed three-member pool; placement order is supplied by the
+    /// entry's RoundRobinStrategy, not by the pool itself.
+    struct SeqPool;
     impl Pool for SeqPool {
-        fn pick(&self) -> Option<String> {
-            let i = self.n.fetch_add(1, Ordering::SeqCst);
-            Some(["a", "b", "c"][(i % 3) as usize].to_string())
-        }
-        fn all_healthy(&self) -> Vec<String> {
-            vec!["a".into(), "b".into(), "c".into()]
+        fn members(&self) -> Vec<BackendMember> {
+            vec![
+                BackendMember::new("a"),
+                BackendMember::new("b"),
+                BackendMember::new("c"),
+            ]
         }
     }
 
@@ -384,10 +498,7 @@ mod tests {
     /// path through Router::resolve_session.
     struct EmptyPool;
     impl Pool for EmptyPool {
-        fn pick(&self) -> Option<String> {
-            None
-        }
-        fn all_healthy(&self) -> Vec<String> {
+        fn members(&self) -> Vec<BackendMember> {
             Vec::new()
         }
     }
@@ -428,12 +539,7 @@ mod tests {
     }
 
     fn router() -> Router {
-        Router::single_pool(
-            Arc::new(SeqPool {
-                n: AtomicU64::new(0),
-            }),
-            Arc::new(StubStore::default()),
-        )
+        Router::single_pool(Arc::new(SeqPool), Arc::new(StubStore::default()))
     }
 
     #[tokio::test]
@@ -463,12 +569,7 @@ mod tests {
     #[tokio::test]
     async fn empty_session_does_not_bind() {
         let store = Arc::new(StubStore::default());
-        let r = Router::single_pool(
-            Arc::new(SeqPool {
-                n: AtomicU64::new(0),
-            }),
-            store.clone() as Arc<dyn AffinityStore>,
-        );
+        let r = Router::single_pool(Arc::new(SeqPool), store.clone() as Arc<dyn AffinityStore>);
         r.resolve_session(&SessionKey::new("u", "")).await.unwrap();
         assert!(store
             .lookup_session(&SessionKey::new("u", "anything"))
@@ -497,19 +598,56 @@ mod tests {
         assert!(r.resolve_op("op", &k).await.unwrap().is_none());
     }
 
+    // ---- SelectionStrategy tests ------------------------------------
+
+    #[test]
+    fn round_robin_strategy_rotates_over_candidates() {
+        let strat = RoundRobinStrategy::default();
+        let members = vec![
+            BackendMember::new("a"),
+            BackendMember::new("b"),
+            BackendMember::new("c"),
+        ];
+        let k = SessionKey::new("u", "s");
+        let ctx = SelectionContext::default();
+        let picks: Vec<usize> = (0..4)
+            .map(|_| strat.select(&k, &members, &ctx).unwrap())
+            .collect();
+        assert_eq!(picks, vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn round_robin_strategy_declines_empty_candidates() {
+        let strat = RoundRobinStrategy::default();
+        let k = SessionKey::new("u", "s");
+        let ctx = SelectionContext::default();
+        assert!(strat.select(&k, &[], &ctx).is_none());
+    }
+
+    #[tokio::test]
+    async fn placement_through_router_rotates_via_strategy() {
+        // The behaviour previously pinned by the pools' own
+        // round-robin tests: successive *new* sessions land on
+        // successive members.
+        let r = router();
+        let mut got = Vec::new();
+        for i in 0..4 {
+            let k = SessionKey::new("u", format!("s{}", i));
+            got.push(r.resolve_session(&k).await.unwrap().unwrap());
+        }
+        assert_eq!(got, vec!["a", "b", "c", "a"]);
+    }
+
     // ---- TenantRouter tests -----------------------------------------
 
-    fn fixed_pool(addr: &'static str) -> Arc<dyn Pool> {
+    fn fixed_pool(addr: &'static str) -> PoolEntry {
         struct FixedPool(&'static str);
         impl Pool for FixedPool {
-            fn pick(&self) -> Option<String> {
-                Some(self.0.to_string())
-            }
-            fn all_healthy(&self) -> Vec<String> {
-                vec![self.0.to_string()]
+            fn members(&self) -> Vec<BackendMember> {
+                vec![BackendMember::new(self.0)]
             }
         }
-        Arc::new(FixedPool(addr))
+        PoolEntry::round_robin(Arc::new(FixedPool(addr)))
     }
 
     #[tokio::test]

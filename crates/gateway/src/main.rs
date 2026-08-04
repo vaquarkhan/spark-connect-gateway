@@ -302,7 +302,9 @@ async fn build_tenant_routing(
             }
             let default_pool = wrap_with_healthcheck(default_pool, &cfg.health_check);
             info!(size = default_size, "default tenant pool ready");
-            Some(default_pool)
+            // Placement is round-robin; per-pool strategy
+            // configuration is not exposed in the config yet.
+            Some(scg_routing::PoolEntry::round_robin(default_pool))
         }
         None => {
             metrics.set_backend_pool_size(0);
@@ -314,7 +316,7 @@ async fn build_tenant_routing(
     // Per-tenant overrides. No metric observer attached — the
     // unlabelled `scg_backend_pool_size` gauge intentionally tracks
     // the default pool only.
-    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    let mut tenants: HashMap<String, scg_routing::PoolEntry> = HashMap::new();
     for (tenant, override_disc) in &cfg.tenant_pools.overrides {
         let (pool, watcher, size) = build_pool_from_discovery(override_disc, None).await?;
         if let Some(h) = watcher {
@@ -326,7 +328,7 @@ async fn build_tenant_routing(
             size,
             "tenant override pool ready"
         );
-        tenants.insert(tenant.clone(), pool);
+        tenants.insert(tenant.clone(), scg_routing::PoolEntry::round_robin(pool));
     }
 
     readiness.mark_ready();

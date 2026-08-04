@@ -87,12 +87,16 @@ backends; there is no pre-provisioning logic and no way to
 weight backends within one tenant's pool (e.g. a tier of larger
 drivers preferred over smaller ones).
 
-**Planned shape:** a `weight` attribute on static pool entries
-first (cheap, config-only), and a pluggable selection strategy
-seam in `scg-routing` if real deployments need more than
-weighted round-robin. Warm-pool management belongs to the
-provisioner (see above); the gateway's part is at most exposing
-"pool below desired size" signals.
+**Planned shape:** the pluggable selection seam now exists in
+`scg-routing` (`SelectionStrategy`, one instance per pool, with
+round-robin as the shipping default; pool members carry
+labels/weight metadata for strategies to key on). Next steps
+behind that seam: a `weight` attribute on static pool config
+entries, a least-sessions strategy, and metadata-aware selection
+(which also serves version-aware placement during rolling
+upgrades). Warm-pool management belongs to the provisioner (see
+above); the gateway's part is at most exposing "pool below
+desired size" signals.
 
 ## Helm chart: HMAC secret via Kubernetes `Secret`
 
@@ -164,8 +168,10 @@ roadmap isn't read as "everything else is coming eventually".
 * **Replicating session state across drivers.** When a driver
   dies its sessions die with it; the gateway surfaces this
   cleanly (`Unavailable`) rather than pretending otherwise.
-* **Extending or replacing the Spark Connect protocol.** Every
-  RPC is forwarded verbatim.
+* **Extending or replacing the Spark Connect protocol.** The
+  gateway adds nothing to the wire protocol; it is transparent to
+  payloads and depends only on a small set of request-envelope
+  fields.
 * **Driver lifecycle management.** Provisioning, scaling
   decisions, and warm-starting drivers belong to the
   provisioner (spark-kubernetes-operator, Kubeflow Spark

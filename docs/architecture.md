@@ -119,7 +119,7 @@ A more precise version of the diagram, with the actual crate seams:
 | limit | `ratelimit` | `RateLimiter::check(tenant, user)` returns `Status::resource_exhausted` if the bucket is empty |
 | key | `routing` | `SessionKey { tenant, user_id, session_id }` constructed from verified identity + request body |
 | lookup | `routing` → `store-memory`/`store-redis` | `AffinityStore::lookup_session(&key)` returns the bound backend if any |
-| pick (on miss) | `routing` → `pool-static`/`pool-k8s` (optionally wrapped by `healthcheck`) | `Pool::pick()` returns one healthy backend address |
+| place (on miss) | `routing` → `pool-static`/`pool-k8s` (optionally wrapped by `healthcheck`) | `SelectionStrategy::select()` chooses one of `Pool::members()` |
 | bind (on miss) | `routing` → store | `AffinityStore::bind_session_if_absent` records the decision atomically |
 | audit | `audit` | `session.create` event emitted on fresh binding only |
 | forward | `proxy` → `Dialer` → tonic client | RPC forwarded with `x-request-id` and `traceparent` propagated |
@@ -170,18 +170,29 @@ authenticator actually work."
 This is where the central abstractions live. Three traits + two
 struct types form the contract every other crate plugs into:
 
-* **`Pool`** — selects a backend address for a *fresh* session.
-  Implementations: round-robin static list, K8s Endpoints watcher.
-  The trait is intentionally tiny (`pick`, `all_healthy`,
+* **`Pool`** — provides pool *membership*: which backends currently
+  exist and are believed healthy, as `BackendMember`s (address plus
+  labels/weight metadata). Implementations: static list, K8s
+  Endpoints watcher. The trait is intentionally tiny (`members`,
   `mark_unhealthy`) so new pool implementations are cheap.
+
+* **`SelectionStrategy`** — chooses which member a *fresh* session
+  is placed on. One strategy instance per pool (paired in a
+  `PoolEntry`), consulted only on the placement path — affinity
+  hits and the operation-id index never go through it, so a
+  misbehaving strategy can skew new placements but cannot break
+  live sessions. Shipping implementation: round-robin; weighted,
+  least-sessions, and metadata-aware strategies are the planned
+  extensions behind this seam.
 
 * **`AffinityStore`** — persists the `SessionKey -> backend address`
   binding so subsequent RPCs reach the same driver. Async trait
   because the production impl (Redis) is a network call.
   Implementations: in-process `HashMap` (single replica) or Redis.
 
-* **`TenantRouter`** — maps a tenant string to its `Pool`. Single-
-  tenant deployments use exactly one entry (often `"default"`).
+* **`TenantRouter`** — maps a tenant string to its `PoolEntry`
+  (pool + strategy). Single-tenant deployments use exactly one
+  entry (often `"default"`).
 
 * **`Router`** — the glue. `Router::resolve_session(&key)` does the
   lookup-then-pick-then-bind dance, returning either an existing
@@ -212,8 +223,8 @@ degradation to pool-only routing on Redis outage. See
 
 ### 4.5 `pool-static` and `pool-k8s`
 
-Two `Pool` impls. `StaticPool` is a `Vec<String>` + an atomic
-round-robin cursor — backends are fixed at startup. `K8sPool` spawns
+Two `Pool` impls. `StaticPool` is a fixed `Vec<String>` decided at
+startup. `K8sPool` spawns
 a `kube-rs` watcher that subscribes to a Service's `Endpoints`
 object and updates the live backend list whenever pods change.
 
@@ -228,7 +239,7 @@ removes. The proxy never blocks on the watcher.
 gRPC health probing. It spawns a probe loop that calls
 `grpc.health.v1.Health/Check` on every backend at a configurable
 interval. After `unhealthy_threshold` consecutive failures it stops
-returning that backend from `pick()`; after `healthy_threshold`
+reporting that backend from `members()`; after `healthy_threshold`
 successes it re-admits.
 
 **Design choice**: the trait is just `Pool`, so `HealthAwarePool`

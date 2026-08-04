@@ -2,17 +2,16 @@
 //! servers. Verifies that:
 //!
 //! 1. A backend whose `Health` server is alive stays in
-//!    `pick()`/`all_healthy()`.
+//!    `members()`.
 //! 2. A backend that goes down (server task dropped) is evicted
 //!    after `unhealthy_threshold` consecutive failed probes.
-//! 3. `pick()` keeps returning the surviving backend.
+//! 3. `members()` keeps reporting only the surviving backend.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use scg_healthcheck::{HealthAwarePool, HealthCheckConfig};
-use scg_routing::Pool;
+use scg_routing::{BackendMember, Pool};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -25,29 +24,23 @@ use tonic_health::server::health_reporter;
 /// health.
 struct StubPool {
     backends: parking_lot::RwLock<Vec<String>>,
-    cursor: AtomicU64,
 }
 
 impl StubPool {
     fn new(backends: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             backends: parking_lot::RwLock::new(backends),
-            cursor: AtomicU64::new(0),
         })
     }
 }
 
 impl Pool for StubPool {
-    fn pick(&self) -> Option<String> {
-        let g = self.backends.read();
-        if g.is_empty() {
-            return None;
-        }
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(g[(idx as usize) % g.len()].clone())
-    }
-    fn all_healthy(&self) -> Vec<String> {
-        self.backends.read().clone()
+    fn members(&self) -> Vec<BackendMember> {
+        self.backends
+            .read()
+            .iter()
+            .map(BackendMember::new)
+            .collect()
     }
 }
 
@@ -96,7 +89,7 @@ async fn evicts_dead_backend_then_keeps_alive_one() {
 
     // Let one probe round complete; both should still be healthy.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let healthy = wrapper.all_healthy();
+    let healthy: Vec<String> = wrapper.members().into_iter().map(|m| m.addr).collect();
     assert!(healthy.contains(&alive), "alive backend should be present");
     assert!(
         healthy.contains(&dying),
@@ -112,7 +105,7 @@ async fn evicts_dead_backend_then_keeps_alive_one() {
     // unhealthy_threshold=2, we expect eviction within ~600ms.
     let mut evicted = false;
     for _ in 0..30 {
-        let healthy = wrapper.all_healthy();
+        let healthy: Vec<String> = wrapper.members().into_iter().map(|m| m.addr).collect();
         if !healthy.contains(&dying) && healthy.contains(&alive) {
             evicted = true;
             break;
@@ -124,8 +117,10 @@ async fn evicts_dead_backend_then_keeps_alive_one() {
         "dying backend should be evicted within the test window"
     );
 
-    // pick() must keep returning the surviving backend.
+    // members() must keep reporting exactly the surviving backend —
+    // any selection strategy applied on top can only choose it.
     for _ in 0..5 {
-        assert_eq!(wrapper.pick().as_deref(), Some(alive.as_str()));
+        let m: Vec<String> = wrapper.members().into_iter().map(|x| x.addr).collect();
+        assert_eq!(m, vec![alive.clone()]);
     }
 }
