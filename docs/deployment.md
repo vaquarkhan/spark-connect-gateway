@@ -550,6 +550,13 @@ reaches the gateway as an env var from the Secret — it never
 appears in the rendered ConfigMap. Rotation requires restarting
 both the backends and the gateway pods.
 
+The
+[`e2e-trust-boundary`](../deploy/examples/e2e-trust-boundary/)
+walkthrough proves the boundary end to end on a kind cluster: a
+direct-to-backend connection is refused with `UNAUTHENTICATED`,
+the same client succeeds through the gateway, and (negative
+control) a gateway with the token disabled is refused too.
+
 ## Day 2: upgrades
 
 `helm upgrade` re-renders templates and rolls the Deployment. Two

@@ -351,6 +351,11 @@ End-to-end walkthroughs (each runs on a fresh kind cluster):
   two gateway replicas backed by the bundled Redis StatefulSet;
   verify affinity bindings survive a gateway pod restart because
   they live in Redis, not in pod memory.
+* [`deploy/examples/e2e-trust-boundary/`](deploy/examples/e2e-trust-boundary/) —
+  backends enforce `spark.connect.authenticate.token` and only the
+  gateway holds it; verify a direct-to-backend connection is refused
+  with `UNAUTHENTICATED` while the same client succeeds through the
+  gateway.
 
 For production-style manifests using the upstream
 [`apache/spark-kubernetes-operator`][4], see
