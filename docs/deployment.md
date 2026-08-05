@@ -467,28 +467,88 @@ The defaults give you function; production needs all of:
 1. **Switch off `auth.type: none`.** External traffic to a
    gateway running with `none` is a "we trust the network" bet that
    ages badly.
-2. **Use external Redis.** The bundled Redis is a SPOF. Pointing at
+2. **Enforce the trust boundary** — see
+   [the section below](#enforcing-the-trust-boundary). Auth at the
+   gateway means nothing if clients can dial the backends directly.
+3. **Use external Redis.** The bundled Redis is a SPOF. Pointing at
    ElastiCache / Memorystore costs little and removes the SPOF.
-3. **Set resource requests/limits.** The chart defaults
+4. **Set resource requests/limits.** The chart defaults
    (100m CPU / 128Mi RAM) are reasonable for low traffic; size up
    to your real load.
-4. **Turn on tracing if you have a collector.** The gateway exports
+5. **Turn on tracing if you have a collector.** The gateway exports
    OTLP/gRPC; logs already include the same correlation ID, but
    spans on a UI like Tempo or Jaeger make multi-hop investigations
    fast. See [`tracing.md`](observability.md#distributed-tracing)
    for the known limitation around inbound `traceparent`.
-5. **Pin the image tag.** `image.tag: ""` resolves to the chart's
+6. **Pin the image tag.** `image.tag: ""` resolves to the chart's
    `appVersion`. For production, set it to a specific digest:
    ```yaml
    image:
      repository: ghcr.io/<your-mirror>/spark-connect-gateway
      tag: "0.1.0@sha256:abc123..."
    ```
-6. **Wire probes to your platform.** The chart already configures
+7. **Wire probes to your platform.** The chart already configures
    `/healthz` and `/readyz` on the admin port; if your platform
    does extra synthetic checks, point them at `/readyz` rather than
    the gRPC port (the gRPC port has no HTTP health endpoint, by
    gRPC convention).
+
+## Enforcing the trust boundary
+
+Every guarantee in this guide — auth, tenant isolation, rate
+limits, audit — holds only while the gateway is the *only* path to
+the backend Spark Connect servers. The backend trusts
+`UserContext.user_id` as presented and keys sessions by
+`(user_id, session_id)`; the gateway rewrites `user_id` with the
+verified identity, which is only meaningful while the gateway is
+the sole writer of it. Any pod that can dial a backend's gRPC port
+directly can claim any identity and reach any session whose id it
+knows or guesses.
+
+Enforce the boundary at two layers; production should use both:
+
+**Network layer — `backendNetworkPolicy`.** An opt-in NetworkPolicy
+that restricts backend-pod ingress to the gateway pods:
+
+```yaml
+backendNetworkPolicy:
+  enabled: true
+  backendPodLabels:
+    app: spark-connect-server
+  grpcPort: 15002
+  # NetworkPolicy is default-deny once it selects a pod: whitelist
+  # any other legitimate ingress (executor→driver traffic on
+  # operator-managed clusters, Spark UI) via additionalIngress.
+```
+
+Requires a CNI that enforces NetworkPolicy (Calico, Cilium, …; some
+managed-cluster defaults do not).
+
+**Auth layer — `backendToken`.** Start every backend with
+`spark.connect.authenticate.token` (Spark 4.0+) and give the token
+only to the gateway; the backend itself then rejects any client
+that bypasses the gateway with `UNAUTHENTICATED`, regardless of
+network topology:
+
+```bash
+# The backends and the gateway share the token via a Secret:
+kubectl -n spark-connect create secret generic scg-backend-token \
+  --from-literal=token="$(openssl rand -hex 32)"
+```
+
+```yaml
+backendToken:
+  enabled: true
+  secretName: scg-backend-token
+  secretKey: token
+```
+
+The gateway then presents `authorization: Bearer <token>` on every
+gateway→backend request. Per-tenant pools can carry their own token
+via `backendToken.tenantOverrides` (see `values.yaml`). The token
+reaches the gateway as an env var from the Secret — it never
+appears in the rendered ConfigMap. Rotation requires restarting
+both the backends and the gateway pods.
 
 ## Day 2: upgrades
 

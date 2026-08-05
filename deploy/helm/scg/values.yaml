@@ -248,6 +248,38 @@ tenantPools:
   onUnknownTenant: use_default
   overrides: {}
 
+# Pre-shared token the gateway presents to backends (as
+# `authorization: Bearer <token>`) — for backend Spark Connect
+# servers started with `spark.connect.authenticate.token`
+# (Spark 4.0+). Holding the token only in the gateway is the
+# auth-layer half of the trust-boundary enforcement: a client that
+# bypasses the gateway is rejected by the backend itself with
+# UNAUTHENTICATED. (`backendNetworkPolicy` below is the network-layer
+# half; production should use both.)
+#
+# Tokens come from existing Kubernetes Secrets — the chart mounts
+# them into the pod as env vars, so the token never appears in the
+# rendered ConfigMap. The gateway reads them once at startup:
+# rotating a Secret requires a rollout restart (and a matching
+# restart of the backends). The default token applies to every pool;
+# a tenant listed in `tenantOverrides` presents its own token to its
+# own pool instead (the tenant should also appear in
+# `tenantPools.overrides`).
+backendToken:
+  enabled: false
+  # Existing Secret holding the default-pool token.
+  secretName: ""
+  secretKey: token
+  # tenant name → {secretName, secretKey} for pools with their own
+  # token. Tenant names are sanitised into env-var names
+  # (SCG_BACKEND_TOKEN_<TENANT>); two tenants that differ only in
+  # punctuation (team-a vs team_a) would collide — avoid that.
+  tenantOverrides: {}
+  # tenantOverrides:
+  #   team-a:
+  #     secretName: team-a-backend-token
+  #     secretKey: token
+
 # How the gateway figures out which tenant each inbound RPC belongs
 # to. The resolved tenant becomes the first segment of the routing
 # key, so two tenants with the same session_id stay isolated.

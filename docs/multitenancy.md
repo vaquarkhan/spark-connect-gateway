@@ -29,6 +29,7 @@ What the gateway gives you at the data plane:
 | Per-tenant identity from auth | `tenantResolver` reads the JWT/static-token tenant claim, a gRPC metadata header, or a fixed string. |
 | Per-tenant backend pools | `tenantPools.overrides` pins a tenant to a dedicated Spark Connect cluster; everything else falls through to a shared default. |
 | Per-tenant quotas | `rateLimit.overrides` sets a token-bucket RPS / burst per tenant; opt-in per-user dimension inside a tenant; per-replica or Redis-shared via `rateLimit.store`. |
+| Per-pool backend credentials | `backendToken` presents a `spark.connect.authenticate.token` bearer to each pool's backends (per-tenant overrides supported), so backends themselves refuse clients that bypass the gateway — see [Enforcing the trust boundary](deployment.md#enforcing-the-trust-boundary). |
 | Tenant-aware audit trail | Every audit event (`session.create`, `auth.failure`, `rpc.error`, …) carries the resolved tenant in a structured field. |
 | Strict-isolation mode | Pair `onMissing=reject` (resolver) with `onUnknownTenant=reject` (pools) so RPCs from unmapped tenants never reach a backend. |
 

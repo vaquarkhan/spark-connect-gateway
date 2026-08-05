@@ -26,7 +26,7 @@ use scg_observability::{
 };
 use scg_pool_k8s::{K8sPool, K8sPoolConfig};
 use scg_pool_static::StaticPool;
-use scg_proxy::{Dialer, SparkConnectProxy};
+use scg_proxy::{BackendTokens, Dialer, SparkConnectProxy};
 use scg_ratelimit::redis::{RedisLimiter, RedisLimiterConfig};
 use scg_ratelimit::{
     BucketRate, FailMode, LimiterObserver, MemoryLimiter, RateLimiter, RedisErrorObserver,
@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
     let tenant_resolver = build_tenant_resolver(&cfg.tenant_resolver);
     let rate_limiter = build_rate_limiter(&cfg.rate_limit, &metrics).await?;
     let audit = build_audit_logger(&cfg.audit);
+    let backend_tokens = build_backend_tokens(&cfg)?;
     let svc = SparkConnectProxy::with_all(
         router,
         dialer,
@@ -86,7 +87,8 @@ async fn main() -> Result<()> {
         tenant_resolver,
         rate_limiter,
         audit,
-    );
+    )
+    .with_backend_tokens(backend_tokens);
 
     let addr = parse_bind_addr(&cfg.bind_addr)?;
     log_startup(&cfg, &addr);
@@ -317,8 +319,9 @@ async fn build_tenant_routing(
     // unlabelled `scg_backend_pool_size` gauge intentionally tracks
     // the default pool only.
     let mut tenants: HashMap<String, scg_routing::PoolEntry> = HashMap::new();
-    for (tenant, override_disc) in &cfg.tenant_pools.overrides {
-        let (pool, watcher, size) = build_pool_from_discovery(override_disc, None).await?;
+    for (tenant, override_cfg) in &cfg.tenant_pools.overrides {
+        let (pool, watcher, size) =
+            build_pool_from_discovery(&override_cfg.discovery, None).await?;
         if let Some(h) = watcher {
             watchers.push(h);
         }
@@ -587,6 +590,41 @@ fn build_audit_logger(cfg: &AuditSettings) -> AuditLogger {
         enabled: cfg.enabled,
         log_successful_rpcs: cfg.log_successful_rpcs,
     })
+}
+
+/// Resolve the configured backend tokens (env vars / files are read
+/// here, once) into the proxy's per-pool credential table. Lookup at
+/// request time mirrors pool selection: a tenant override with its
+/// own `backend_token` uses it; every other tenant — including
+/// overrides without one and unknown tenants routed to the default
+/// pool — inherits the top-level `backend_token`.
+///
+/// Token *values* never appear in logs; only which pools have one.
+fn build_backend_tokens(cfg: &Config) -> Result<BackendTokens> {
+    let default = cfg
+        .backend_token
+        .as_ref()
+        .map(|src| src.resolve())
+        .transpose()
+        .context("resolving backend_token")?;
+    let mut per_tenant = HashMap::new();
+    for (tenant, override_cfg) in &cfg.tenant_pools.overrides {
+        if let Some(src) = &override_cfg.backend_token {
+            let token = src
+                .resolve()
+                .with_context(|| format!("resolving backend_token for tenant {tenant}"))?;
+            per_tenant.insert(tenant.clone(), token);
+        }
+    }
+    let tokens = BackendTokens::new(default, per_tenant).context("encoding backend tokens")?;
+    if tokens.is_configured() {
+        info!(
+            default_pool_token = cfg.backend_token.is_some(),
+            tenant_overrides = tokens.tenant_override_count(),
+            "outbound backend authentication enabled"
+        );
+    }
+    Ok(tokens)
 }
 
 /// Translate the YAML `tenant_resolver:` block into a runtime

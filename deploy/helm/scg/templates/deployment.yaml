@@ -50,6 +50,23 @@ spec:
           args:
             - "--config"
             - "/etc/scg/config.yaml"
+          {{- if .Values.backendToken.enabled }}
+          env:
+            {{- if .Values.backendToken.secretName }}
+            - name: SCG_BACKEND_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backendToken.secretName }}
+                  key: {{ .Values.backendToken.secretKey | default "token" }}
+            {{- end }}
+            {{- range $tenant, $ref := .Values.backendToken.tenantOverrides }}
+            - name: {{ include "scg.backendTokenEnvName" $tenant }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required (printf "backendToken.tenantOverrides.%s.secretName is required" $tenant) $ref.secretName }}
+                  key: {{ $ref.secretKey | default "token" }}
+            {{- end }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.grpcPort }}

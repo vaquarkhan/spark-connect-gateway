@@ -65,6 +65,15 @@ app.kubernetes.io/component: gateway
 {{- end }}
 
 {{/*
+Env-var name carrying one tenant's backend token. Takes the tenant
+name as its argument. Sanitisation can collide (team-a vs team_a);
+values.yaml documents the constraint.
+*/}}
+{{- define "scg.backendTokenEnvName" -}}
+SCG_BACKEND_TOKEN_{{ regexReplaceAll "[^A-Za-z0-9]" . "_" | upper }}
+{{- end }}
+
+{{/*
 Full label set for the bundled Redis resources.
 */}}
 {{- define "scg.redis.labels" -}}

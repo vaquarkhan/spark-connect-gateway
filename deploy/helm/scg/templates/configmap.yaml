@@ -34,6 +34,26 @@ data:
     {{- fail "backendDiscovery may only be omitted when tenantPools.onUnknownTenant is \"reject\" and tenantPools.overrides is non-empty" }}
     {{- end }}
 
+    {{- /* ---- backend token (gateway→backend auth) ----
+         The token values live in Secrets and reach the gateway as
+         env vars (see deployment.yaml); the config only names the
+         env var, so no credential lands in this ConfigMap. */}}
+    {{- if .Values.backendToken.enabled }}
+    {{- if and (not .Values.backendToken.secretName) (not .Values.backendToken.tenantOverrides) }}
+    {{- fail "backendToken.enabled requires backendToken.secretName and/or backendToken.tenantOverrides" }}
+    {{- end }}
+    {{- range $tenant, $_ := .Values.backendToken.tenantOverrides }}
+    {{- if not (hasKey $.Values.tenantPools.overrides $tenant) }}
+    {{- fail (printf "backendToken.tenantOverrides.%s has no matching tenantPools.overrides entry (a per-tenant token belongs to that tenant's own pool)" $tenant) }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.backendToken.secretName }}
+    backend_token:
+      kind: env
+      name: SCG_BACKEND_TOKEN
+    {{- end }}
+    {{- end }}
+
     {{- /* ---- auth ---- */}}
     {{- if eq .Values.auth.type "none" }}
     auth:
@@ -191,6 +211,11 @@ data:
           port: {{ $disc.port }}
           {{- else }}
           {{- fail (printf "tenantPools.overrides.%s.type must be static|k8s, got %q" $tenant $disc.type) }}
+          {{- end }}
+          {{- if and $.Values.backendToken.enabled (hasKey $.Values.backendToken.tenantOverrides $tenant) }}
+          backend_token:
+            kind: env
+            name: {{ include "scg.backendTokenEnvName" $tenant }}
           {{- end }}
         {{- end }}
       {{- end }}

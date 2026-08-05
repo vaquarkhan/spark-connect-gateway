@@ -22,6 +22,7 @@ use tracing::{info, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::dial::Dialer;
+use crate::outbound::BackendTokens;
 
 /// gRPC handler implementing `SparkConnectService` as a forwarding proxy.
 ///
@@ -58,6 +59,10 @@ pub struct SparkConnectProxy {
     /// handlers can call into it unconditionally without
     /// `Option::map` ceremony.
     audit: AuditLogger,
+    /// Per-pool `authorization: Bearer …` credentials presented on
+    /// the gateway→backend hop, for backends that enforce
+    /// `spark.connect.authenticate.token`. Defaults to none.
+    backend_tokens: BackendTokens,
 }
 
 impl SparkConnectProxy {
@@ -146,11 +151,27 @@ impl SparkConnectProxy {
             tenant_resolver,
             rate_limiter,
             audit,
+            backend_tokens: BackendTokens::none(),
         }
+    }
+
+    /// Attach per-pool backend credentials (chainable). Without this
+    /// the gateway sends no `authorization` header to backends.
+    pub fn with_backend_tokens(mut self, tokens: BackendTokens) -> Self {
+        self.backend_tokens = tokens;
+        self
     }
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Stamp everything an outbound request needs: correlation ID,
+    /// W3C traceparent, and — when configured — the backend pool's
+    /// `authorization: Bearer …` credential for `tenant`.
+    fn stamp_outbound<T>(&self, req: &mut Request<T>, request_id: &str, tenant: &str) {
+        stamp_propagation(req, request_id);
+        self.backend_tokens.apply(tenant, req);
     }
 
     fn client(
@@ -463,7 +484,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             info!(rid = %rid, rpc = "AnalyzePlan", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.analyze_plan(outbound).await
         }
         .instrument(span)
@@ -497,7 +518,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             info!(rid = %rid, rpc = "Config", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.config(outbound).await
         }
         .instrument(span)
@@ -525,7 +546,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.artifact_status(outbound).await
         }
         .instrument(span)
@@ -566,7 +587,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&op_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.interrupt(outbound).await
         }
         .instrument(span)
@@ -602,7 +623,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&op_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let resp = c.release_execute(outbound).await?;
             // On a successful release the server has dropped the operation, so
             // we drop our reverse-index entry too.
@@ -641,7 +662,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let resp = c.release_session(outbound).await?;
             self.router.forget_session(&key).await;
             self.audit.session_release(
@@ -686,7 +707,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.fetch_error_details(outbound).await
         }
         .instrument(span)
@@ -721,7 +742,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let resp = c.clone_session(outbound).await?;
 
             // The cloned session's state lives on the driver that
@@ -790,7 +811,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             c.get_status(outbound).await
         }
         .instrument(span)
@@ -842,7 +863,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
 
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let upstream = c.execute_plan(outbound).await?.into_inner();
             Ok(Response::new(forward_server_stream(upstream, stream_guard)))
         }
@@ -883,7 +904,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let addr = require_addr(self.router.resolve_op(&body.operation_id, &key).await)?;
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let upstream = c.reattach_execute(outbound).await?.into_inner();
             Ok(Response::new(forward_server_stream(upstream, stream_guard)))
         }
@@ -947,7 +968,7 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             });
 
             let mut outbound = Request::new(ReceiverStream::new(rx));
-            stamp_propagation(&mut outbound, &rid);
+            self.stamp_outbound(&mut outbound, &rid, &tenant);
             let resp = c.add_artifacts(outbound).await?;
             Ok(resp)
         }
