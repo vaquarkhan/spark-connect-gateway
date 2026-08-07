@@ -32,6 +32,13 @@
 //! * Responses are filtered rather than requests. Dropping keys from
 //!   the request would desynchronise positional expectations in
 //!   clients that assume one response pair per requested key.
+//! * "Unset" does not look the same on every operation: `GetAll`
+//!   omits the key, `Get` / `GetOption` return a pair with no value,
+//!   and `GetWithDefault` resolves to the default the caller passed
+//!   in. Substituting the wrong one still withholds the secret, but
+//!   makes the gateway's filtering observable.
+
+use std::collections::HashMap;
 
 use scg_genproto::pb;
 
@@ -47,17 +54,29 @@ fn is_withheld(key: &str) -> bool {
         .any(|blocked| key.eq_ignore_ascii_case(blocked))
 }
 
+/// What a withheld key should look like in the response, so that it
+/// is indistinguishable from a key the backend never had.
+enum Substitute {
+    /// `GetAll` enumerates whatever exists, so an absent key simply
+    /// is not listed. (Dropping the pair is also required, not just
+    /// tidier: the Spark client asserts `hasValue` on every pair
+    /// `GetAll` returns.)
+    Drop,
+    /// `Get` / `GetOption` report an unset key as a pair with no
+    /// value, and callers expect one pair per requested key.
+    NoValue,
+    /// `GetWithDefault` resolves an unset key to the default the
+    /// caller supplied, keyed here by config key. A key the caller
+    /// asked about with no default of its own maps to `None`.
+    Defaults(HashMap<String, Option<String>>),
+}
+
 /// Response-side redaction plan derived from a `ConfigRequest`.
 pub(crate) struct ConfigGuard {
     /// Prefix `handleGetAll` stripped from the response keys, if the
     /// operation was a prefixed `GetAll`.
     prefix: String,
-    /// `GetAll` enumerates whatever exists, so a withheld key is
-    /// omitted outright — indistinguishable from "not set". Keyed
-    /// lookups keep the key with no value, which is how Spark
-    /// reports an unset key on `GetOption` and keeps one pair per
-    /// requested key.
-    drop_pair: bool,
+    substitute: Substitute,
 }
 
 impl ConfigGuard {
@@ -66,11 +85,23 @@ impl ConfigGuard {
         match req.operation.as_ref().and_then(|o| o.op_type.as_ref()) {
             Some(OpType::GetAll(get_all)) => Self {
                 prefix: get_all.prefix.clone().unwrap_or_default(),
-                drop_pair: true,
+                substitute: Substitute::Drop,
             },
+            Some(OpType::GetWithDefault(get_with_default)) => {
+                let defaults = get_with_default
+                    .pairs
+                    .iter()
+                    .filter(|pair| is_withheld(&pair.key))
+                    .map(|pair| (pair.key.clone(), pair.value.clone()))
+                    .collect();
+                Self {
+                    prefix: String::new(),
+                    substitute: Substitute::Defaults(defaults),
+                }
+            }
             _ => Self {
                 prefix: String::new(),
-                drop_pair: false,
+                substitute: Substitute::NoValue,
             },
         }
     }
@@ -83,22 +114,34 @@ impl ConfigGuard {
         // pair key alone is not the config key.
         let full_key = |key: &str| format!("{}{}", self.prefix, key);
 
-        if self.drop_pair {
-            resp.pairs.retain(|pair| {
-                let key = full_key(&pair.key);
-                if is_withheld(&key) {
-                    redacted.push(key);
-                    false
-                } else {
-                    true
+        match &self.substitute {
+            Substitute::Drop => {
+                resp.pairs.retain(|pair| {
+                    let key = full_key(&pair.key);
+                    if is_withheld(&key) {
+                        redacted.push(key);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            Substitute::NoValue => {
+                for pair in &mut resp.pairs {
+                    let key = full_key(&pair.key);
+                    if is_withheld(&key) {
+                        redacted.push(key);
+                        pair.value = None;
+                    }
                 }
-            });
-        } else {
-            for pair in &mut resp.pairs {
-                let key = full_key(&pair.key);
-                if is_withheld(&key) {
-                    redacted.push(key);
-                    pair.value = None;
+            }
+            Substitute::Defaults(defaults) => {
+                for pair in &mut resp.pairs {
+                    let key = full_key(&pair.key);
+                    if is_withheld(&key) {
+                        redacted.push(key.clone());
+                        pair.value = defaults.get(&key).cloned().flatten();
+                    }
                 }
             }
         }
@@ -128,6 +171,14 @@ mod tests {
         request(pb::config_request::operation::OpType::Get(
             pb::config_request::Get {
                 keys: keys.iter().map(|k| k.to_string()).collect(),
+            },
+        ))
+    }
+
+    fn get_with_default_request(pairs: &[(&str, Option<&str>)]) -> pb::ConfigRequest {
+        request(pb::config_request::operation::OpType::GetWithDefault(
+            pb::config_request::GetWithDefault {
+                pairs: pairs.iter().map(|(k, v)| pair(k, *v)).collect(),
             },
         ))
     }
@@ -240,6 +291,47 @@ mod tests {
         let guard = ConfigGuard::for_request(&get_request(&["SPARK.CONNECT.AUTHENTICATE.TOKEN"]));
         let mut resp = response(vec![pair(
             "SPARK.CONNECT.AUTHENTICATE.TOKEN",
+            Some("SUPERSECRET"),
+        )]);
+        let redacted = guard.apply(&mut resp);
+
+        assert_eq!(redacted.len(), 1);
+        assert_eq!(resp.pairs[0].value, None);
+    }
+
+    #[test]
+    fn get_with_default_resolves_to_the_callers_default() {
+        // What an unset key does on this operation: the caller's own
+        // default comes back. Returning no value would still withhold
+        // the secret, but it would tell the caller that something
+        // filtered the response.
+        let guard = ConfigGuard::for_request(&get_with_default_request(&[
+            ("spark.connect.authenticate.token", Some("fallback")),
+            ("spark.sql.shuffle.partitions", Some("100")),
+        ]));
+        let mut resp = response(vec![
+            pair("spark.connect.authenticate.token", Some("SUPERSECRET")),
+            pair("spark.sql.shuffle.partitions", Some("200")),
+        ]);
+        let redacted = guard.apply(&mut resp);
+
+        assert_eq!(redacted, vec!["spark.connect.authenticate.token"]);
+        assert_eq!(resp.pairs[0].value.as_deref(), Some("fallback"));
+        // The backend's answer for everything else is untouched — the
+        // caller's default is not a substitute for a real value.
+        assert_eq!(resp.pairs[1].value.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn get_with_default_without_a_default_yields_no_value() {
+        // `GetWithDefault` allows a pair with no value; an unset key
+        // then resolves to nothing.
+        let guard = ConfigGuard::for_request(&get_with_default_request(&[(
+            "spark.connect.authenticate.token",
+            None,
+        )]));
+        let mut resp = response(vec![pair(
+            "spark.connect.authenticate.token",
             Some("SUPERSECRET"),
         )]);
         let redacted = guard.apply(&mut resp);
