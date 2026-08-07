@@ -20,6 +20,10 @@ Three assertions, run in order:
    Disabling `backendToken` and retrying shows the backend refusing
    the gateway itself — the token is the discriminator, nothing
    else.
+4. **The token cannot be read back through the gateway.** A client
+   asking the `Config` RPC for `spark.connect.authenticate.token`
+   sees it as unset, and the gateway records a `config.redacted`
+   audit event.
 
 See [Enforcing the trust
 boundary](../../../docs/deployment.md#enforcing-the-trust-boundary)
@@ -27,8 +31,15 @@ for the production guidance (this token layer plus a
 NetworkPolicy). Note the NetworkPolicy half cannot be demonstrated
 on a default kind cluster — kind's default CNI (kindnetd) does not
 enforce NetworkPolicy at all, which is itself a good illustration
-of why the token layer matters: it works regardless of what the
-CNI does.
+of why the token layer matters: it does not depend on the CNI.
+
+The token layer has a dependency of its own, though: it only holds
+while clients cannot *read* the token. Spark's `Config` RPC will
+hand back any config key it holds, so the gateway withholds
+`spark.connect.authenticate.token` from every `Config` response —
+see [The token is only as private as the `Config`
+RPC](../../../docs/deployment.md#the-token-is-only-as-private-as-the-config-rpc).
+Step 8 below checks that.
 
 ## What this does NOT exercise
 
@@ -195,6 +206,47 @@ Restore it and the step-6 client works again:
 helm upgrade scg ./deploy/helm/scg -n spark-connect \
   -f deploy/examples/e2e-trust-boundary/values.yaml
 ```
+
+### 8. Assertion 4: the token cannot be read back through the gateway
+
+Restore `backendToken` if you disabled it in step 7, restart the
+port-forward to the gateway, then ask for the token itself:
+
+```bash
+/tmp/scg-e2e-venv/bin/python3 - <<'PY'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.remote("sc://localhost:15003").getOrCreate()
+print("token via gateway   =", spark.conf.get("spark.connect.authenticate.token"))
+# Control: a key set only on the backend command line, to show the
+# Config RPC itself still works and really is reading server config.
+print("marker via gateway  =", spark.conf.get("spark.poc.marker", "<unset>"))
+spark.stop()
+PY
+```
+
+Expected — the token reads as unset while ordinary keys are
+unaffected:
+
+```
+token via gateway   = None
+marker via gateway  = <unset>
+```
+
+(Add `--conf spark.poc.marker=server-side-only-value` to the
+backend manifest if you want the control to return a value.)
+
+The withholding is recorded in the audit stream:
+
+```bash
+kubectl logs -n spark-connect deploy/scg | grep config.redacted
+# {"...","fields":{"message":"config key withheld from client",
+#   "event":"config.redacted","tenant":"default","user_id":"anonymous",
+#   "key":"spark.connect.authenticate.token"}}
+```
+
+Without this filter the same call returns the token verbatim, and
+any user the gateway authorizes can then use it to reach the
+backend directly — defeating assertions 1–3.
 
 ## Tearing down
 

@@ -21,6 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::config_filter::ConfigGuard;
 use crate::dial::Dialer;
 use crate::outbound::BackendTokens;
 
@@ -516,10 +517,26 @@ impl pb::spark_connect_service_server::SparkConnectService for SparkConnectProxy
             let key = key_from_identity(&tenant, &body.session_id, &identity);
             let addr = require_addr(self.resolve_session_audited(&key, &rid, &identity).await)?;
             info!(rid = %rid, rpc = "Config", user = %identity.user_id, session = %key.session_id, %addr, "forwarding");
+            // Spark's Config handler will hand back any key it holds,
+            // including the gateway↔backend pre-shared token. Decide
+            // what to withhold before the body is moved.
+            let guard = ConfigGuard::for_request(&body);
             let mut c = self.client(&addr)?;
             let mut outbound = Request::new(body);
             self.stamp_outbound(&mut outbound, &rid, &tenant);
-            c.config(outbound).await
+            let mut resp = c.config(outbound).await?;
+            for withheld in guard.apply(resp.get_mut()) {
+                self.audit
+                    .config_redacted(&rid, &tenant, &identity.user_id, &withheld);
+                warn!(
+                    rid = %rid,
+                    user = %identity.user_id,
+                    tenant = %tenant,
+                    key = %withheld,
+                    "Config: withheld a backend-only key from the client"
+                );
+            }
+            Ok(resp)
         }
         .instrument(span)
         .await;

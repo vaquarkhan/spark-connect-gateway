@@ -281,3 +281,282 @@ async fn enforcing_backend_rejects_direct_but_accepts_gateway() {
         .await
         .unwrap();
 }
+
+/// Backend that answers `Config` the way Spark's
+/// `SparkConnectConfigHandler` does: whatever key you ask for, you
+/// get its value back — including the server's own pre-shared token.
+struct LeakyConfigBackend {
+    token: String,
+}
+
+impl LeakyConfigBackend {
+    fn lookup(&self, key: &str) -> Option<String> {
+        match key {
+            "spark.connect.authenticate.token" => Some(self.token.clone()),
+            "spark.sql.shuffle.partitions" => Some("200".into()),
+            _ => None,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl pb::spark_connect_service_server::SparkConnectService for LeakyConfigBackend {
+    type ExecutePlanStream = std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<pb::ExecutePlanResponse, Status>> + Send + 'static>,
+    >;
+    type ReattachExecuteStream = Self::ExecutePlanStream;
+
+    async fn config(
+        &self,
+        req: Request<pb::ConfigRequest>,
+    ) -> Result<Response<pb::ConfigResponse>, Status> {
+        use pb::config_request::operation::OpType;
+        let body = req.into_inner();
+        let mut pairs = Vec::new();
+        match body.operation.as_ref().and_then(|o| o.op_type.as_ref()) {
+            Some(OpType::Get(get)) => {
+                for key in &get.keys {
+                    pairs.push(pb::KeyValue {
+                        key: key.clone(),
+                        value: self.lookup(key),
+                    });
+                }
+            }
+            Some(OpType::GetAll(get_all)) => {
+                // Mirrors handleGetAll: filter by prefix, then return
+                // the keys with that prefix stripped off.
+                let prefix = get_all.prefix.clone().unwrap_or_default();
+                for key in [
+                    "spark.connect.authenticate.token",
+                    "spark.sql.shuffle.partitions",
+                ] {
+                    if let Some(stripped) = key.strip_prefix(prefix.as_str()) {
+                        pairs.push(pb::KeyValue {
+                            key: stripped.to_string(),
+                            value: self.lookup(key),
+                        });
+                    }
+                }
+            }
+            _ => return Err(Status::unimplemented("only Get/GetAll in this fixture")),
+        }
+        Ok(Response::new(pb::ConfigResponse {
+            session_id: body.session_id,
+            pairs,
+            ..Default::default()
+        }))
+    }
+
+    async fn analyze_plan(
+        &self,
+        _: Request<pb::AnalyzePlanRequest>,
+    ) -> Result<Response<pb::AnalyzePlanResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn artifact_status(
+        &self,
+        _: Request<pb::ArtifactStatusesRequest>,
+    ) -> Result<Response<pb::ArtifactStatusesResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn interrupt(
+        &self,
+        _: Request<pb::InterruptRequest>,
+    ) -> Result<Response<pb::InterruptResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn release_execute(
+        &self,
+        _: Request<pb::ReleaseExecuteRequest>,
+    ) -> Result<Response<pb::ReleaseExecuteResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn release_session(
+        &self,
+        _: Request<pb::ReleaseSessionRequest>,
+    ) -> Result<Response<pb::ReleaseSessionResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn fetch_error_details(
+        &self,
+        _: Request<pb::FetchErrorDetailsRequest>,
+    ) -> Result<Response<pb::FetchErrorDetailsResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn get_status(
+        &self,
+        _: Request<pb::GetStatusRequest>,
+    ) -> Result<Response<pb::GetStatusResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn clone_session(
+        &self,
+        _: Request<pb::CloneSessionRequest>,
+    ) -> Result<Response<pb::CloneSessionResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn execute_plan(
+        &self,
+        _: Request<pb::ExecutePlanRequest>,
+    ) -> Result<Response<Self::ExecutePlanStream>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn reattach_execute(
+        &self,
+        _: Request<pb::ReattachExecuteRequest>,
+    ) -> Result<Response<Self::ReattachExecuteStream>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+    async fn add_artifacts(
+        &self,
+        _: Request<tonic::Streaming<pb::AddArtifactsRequest>>,
+    ) -> Result<Response<pb::AddArtifactsResponse>, Status> {
+        Err(Status::unimplemented("n/a"))
+    }
+}
+
+async fn spawn_leaky_rig(
+    token: &str,
+) -> (
+    Channel,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let backend = LeakyConfigBackend {
+        token: token.to_string(),
+    };
+    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = lis.local_addr().unwrap().to_string();
+    let (btx, brx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::spark_connect_service_server::SparkConnectServiceServer::new(backend))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(lis), async {
+                let _ = brx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let store: Arc<dyn AffinityStore> = Arc::new(MemoryStore::new());
+    let pool: Arc<dyn Pool> =
+        Arc::new(scg_pool_static::StaticPool::new(vec![backend_addr]).unwrap());
+    let router = Arc::new(Router::new(TenantRouter::single(pool), store));
+    let tokens = BackendTokens::new(Some(token.to_string()), HashMap::new()).unwrap();
+    let proxy = SparkConnectProxy::new(router, Dialer::new()).with_backend_tokens(tokens);
+
+    let gw_lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_addr = gw_lis.local_addr().unwrap();
+    let (gtx, grx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::spark_connect_service_server::SparkConnectServiceServer::new(proxy))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(gw_lis), async {
+                let _ = grx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let channel = Endpoint::from_shared(format!("http://{}", gw_addr))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(2))
+        .connect()
+        .await
+        .unwrap();
+    (channel, btx, gtx)
+}
+
+fn config_get(keys: &[&str]) -> pb::ConfigRequest {
+    pb::ConfigRequest {
+        session_id: "s1".into(),
+        operation: Some(pb::config_request::Operation {
+            op_type: Some(pb::config_request::operation::OpType::Get(
+                pb::config_request::Get {
+                    keys: keys.iter().map(|k| k.to_string()).collect(),
+                },
+            )),
+        }),
+        ..Default::default()
+    }
+}
+
+fn config_get_all(prefix: Option<&str>) -> pb::ConfigRequest {
+    pb::ConfigRequest {
+        session_id: "s1".into(),
+        operation: Some(pb::config_request::Operation {
+            op_type: Some(pb::config_request::operation::OpType::GetAll(
+                pb::config_request::GetAll {
+                    prefix: prefix.map(str::to_string),
+                },
+            )),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn backend_token_is_not_readable_through_the_gateway() {
+    // The end-to-end property: a client the gateway authorized must
+    // not be able to read the gateway↔backend credential, even
+    // though the backend hands it over on request.
+    let (channel, _b, _g) = spawn_leaky_rig("SUPERSECRET").await;
+    let resp = client(channel)
+        .config(config_get(&[
+            "spark.connect.authenticate.token",
+            "spark.sql.shuffle.partitions",
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.pairs.len(), 2);
+    assert_eq!(resp.pairs[0].key, "spark.connect.authenticate.token");
+    assert_eq!(resp.pairs[0].value, None, "token must not reach the client");
+    assert_eq!(resp.pairs[1].value.as_deref(), Some("200"));
+}
+
+#[tokio::test]
+async fn backend_token_is_not_readable_via_get_all() {
+    let (channel, _b, _g) = spawn_leaky_rig("SUPERSECRET").await;
+    let resp = client(channel)
+        .config(config_get_all(None))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        !resp
+            .pairs
+            .iter()
+            .any(|p| p.value.as_deref() == Some("SUPERSECRET")),
+        "token leaked through GetAll: {:?}",
+        resp.pairs
+    );
+    assert!(resp
+        .pairs
+        .iter()
+        .any(|p| p.key == "spark.sql.shuffle.partitions"));
+}
+
+#[tokio::test]
+async fn backend_token_is_not_readable_via_prefixed_get_all() {
+    // The prefix form is the subtle one: the backend strips the
+    // prefix from the keys it returns, so the response says
+    // `authenticate.token`, not the full key.
+    let (channel, _b, _g) = spawn_leaky_rig("SUPERSECRET").await;
+    let resp = client(channel)
+        .config(config_get_all(Some("spark.connect.")))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        !resp
+            .pairs
+            .iter()
+            .any(|p| p.value.as_deref() == Some("SUPERSECRET")),
+        "token leaked through prefixed GetAll: {:?}",
+        resp.pairs
+    );
+}

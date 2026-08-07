@@ -527,8 +527,8 @@ managed-cluster defaults do not).
 **Auth layer — `backendToken`.** Start every backend with
 `spark.connect.authenticate.token` (Spark 4.0+) and give the token
 only to the gateway; the backend itself then rejects any client
-that bypasses the gateway with `UNAUTHENTICATED`, regardless of
-network topology:
+that bypasses the gateway with `UNAUTHENTICATED`, without relying
+on the CNI to enforce network policy:
 
 ```bash
 # The backends and the gateway share the token via a Secret:
@@ -556,6 +556,43 @@ walkthrough proves the boundary end to end on a kind cluster: a
 direct-to-backend connection is refused with `UNAUTHENTICATED`,
 the same client succeeds through the gateway, and (negative
 control) a gateway with the token disabled is refused too.
+
+### The token is only as private as the `Config` RPC
+
+The auth layer rests on clients not learning the token, and that
+is not something the backend guarantees on its own. Spark's
+`Config` RPC reads back any key the session holds — including
+`spark.connect.authenticate.token`, since `SQLConf.mergeSparkConf`
+copies every `SparkConf` entry into the session config and the
+read path (`handleGet` / `handleGetOption` / `handleGetWithDefault`
+/ `handleGetAll`) applies no denylist. In Spark's own
+client-to-server model that leaks nothing: the client had to
+present the token to connect at all. Behind a gateway it would,
+because there the token is a gateway-only secret and users
+authenticate with something else.
+
+**The gateway therefore withholds that key from every `Config`
+response**, unconditionally — a proxy cannot assume every backend
+it forwards to has been patched. A client asking for it sees the
+key as unset (and `GetAll` omits it), and the attempt is recorded
+in the audit stream as `config.redacted`, which is worth alerting
+on: a legitimate client has no reason to read the gateway↔backend
+credential.
+
+Two consequences worth planning around:
+
+* Fixing this in Spark itself (so the backend never discloses the
+  key) is the complementary half, and is being pursued upstream.
+  Until then the gateway is the only thing standing between a
+  client and the token, which is one more reason to keep the
+  NetworkPolicy layer on.
+* If you deploy a **different** proxy, or let clients reach
+  backends directly for any reason, this reasoning does not carry
+  over — the token is readable by anyone who can complete a
+  `Config` call.
+
+Credit: this was reported privately by an external reviewer, who
+also verified it against 4.0.3, 4.1.2 and 4.2.0.
 
 ## Day 2: upgrades
 
