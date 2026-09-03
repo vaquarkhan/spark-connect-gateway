@@ -202,6 +202,24 @@ spark = SparkSession.builder.remote(
 ).getOrCreate()
 ```
 
+Authenticating clients at the gateway only helps if clients cannot
+dial the backends directly. For that, start the backends with
+`spark.connect.authenticate.token` (Spark 4.0+) and give the token
+only to the gateway:
+
+```yaml
+# Presented as `authorization: Bearer …` on every gateway→backend
+# request; per-tenant pools can override it. Backends then reject
+# clients that bypass the gateway with UNAUTHENTICATED.
+backend_token:
+  kind: env            # inline | env | file
+  name: SCG_BACKEND_TOKEN
+```
+
+See [Enforcing the trust
+boundary](docs/deployment.md#enforcing-the-trust-boundary) for the
+full story (including the complementary NetworkPolicy).
+
 ### Sharing affinity across gateway replicas (Redis)
 
 The default in-memory affinity store works only for a single gateway
@@ -333,6 +351,11 @@ End-to-end walkthroughs (each runs on a fresh kind cluster):
   two gateway replicas backed by the bundled Redis StatefulSet;
   verify affinity bindings survive a gateway pod restart because
   they live in Redis, not in pod memory.
+* [`deploy/examples/e2e-trust-boundary/`](deploy/examples/e2e-trust-boundary/) —
+  backends enforce `spark.connect.authenticate.token` and only the
+  gateway holds it; verify a direct-to-backend connection is refused
+  with `UNAUTHENTICATED` while the same client succeeds through the
+  gateway.
 
 For production-style manifests using the upstream
 [`apache/spark-kubernetes-operator`][4], see

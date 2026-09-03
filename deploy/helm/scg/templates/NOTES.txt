@@ -7,8 +7,10 @@ Resources installed:
 {{- if .Values.redis.enabled }}
   Redis (bundled): {{ include "scg.redis.host" . }} (StatefulSet, 1 replica)
 {{- end }}
+{{- if .Values.backendDiscovery }}
 {{- if eq .Values.backendDiscovery.type "k8s" }}
   RBAC         : Role + RoleBinding granting endpoints get/list/watch in namespace {{ .Values.backendDiscovery.k8s.namespace }}
+{{- end }}
 {{- end }}
 
 Connect a PySpark client to the gateway:

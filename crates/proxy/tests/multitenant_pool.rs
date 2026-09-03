@@ -23,7 +23,7 @@ use scg_genproto::pb;
 use scg_observability::Metrics;
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
-use scg_routing::{AffinityStore, Pool, Router, TenantRouter, UnknownTenantPolicy};
+use scg_routing::{AffinityStore, PoolEntry, Router, TenantRouter, UnknownTenantPolicy};
 use scg_store_memory::MemoryStore;
 use scg_tenant::{OnMissing, TenantResolver, TenantResolverConfig, TenantSource};
 use tokio::net::TcpListener;
@@ -218,16 +218,16 @@ async fn per_tenant_pools_route_to_their_own_backends() {
     let (be_b, _kb) = spawn_backend("be-b").await;
     let (be_default, _kd) = spawn_backend("be-default").await;
 
-    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    let mut tenants: HashMap<String, PoolEntry> = HashMap::new();
     tenants.insert(
         "team-a".into(),
-        Arc::new(StaticPool::new(vec![be_a]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_a]).unwrap())),
     );
     tenants.insert(
         "team-b".into(),
-        Arc::new(StaticPool::new(vec![be_b]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_b]).unwrap())),
     );
-    let default_pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_default]).unwrap());
+    let default_pool = PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_default]).unwrap()));
     let tr = TenantRouter::new(tenants, Some(default_pool), UnknownTenantPolicy::UseDefault);
 
     let (ch, _gw) = spawn_gateway(tr).await;
@@ -247,10 +247,10 @@ async fn per_tenant_pools_route_to_their_own_backends() {
 async fn reject_policy_returns_permission_denied_for_unknown_tenant() {
     let (be_a, _ka) = spawn_backend("be-a").await;
 
-    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    let mut tenants: HashMap<String, PoolEntry> = HashMap::new();
     tenants.insert(
         "team-a".into(),
-        Arc::new(StaticPool::new(vec![be_a]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_a]).unwrap())),
     );
     // Reject policy, no default pool. An unknown tenant must fail
     // loudly with PermissionDenied.
@@ -273,7 +273,7 @@ async fn back_compat_single_pool_via_default_only() {
     // Empty `overrides` map: every tenant routes through the
     // configured default. This is the single-tenant baseline.
     let (be_default, _kd) = spawn_backend("be-default").await;
-    let default_pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_default]).unwrap());
+    let default_pool = PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_default]).unwrap()));
     let tr = TenantRouter::new(
         HashMap::new(),
         Some(default_pool),

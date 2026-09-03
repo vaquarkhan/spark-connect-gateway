@@ -36,8 +36,15 @@ errors (`InvalidArgument`, `Unauthenticated`, etc.) — they are
 
 Cardinality budget: total label cardinality of `scg_*` is bounded
 at chart-install time (12 RPC names × 17 status codes + small
-fixed sets). No per-tenant labels, no per-session-id labels — those
-belong in logs and traces, not metrics.
+fixed sets). `session_id`, `operation_id`, and `user_id` are
+**never** metric labels — they are unbounded and belong in logs,
+audit events, and trace attributes only. The one identity-adjacent
+label is `tenant`, which appears solely on the two rate-limit
+counters (`scg_rate_limit_rejected_total`,
+`scg_rate_limit_redis_errors_total`); its cardinality is bounded
+by the tenant set the resolver admits, so deployments deriving
+tenants from token claims under a permissive unknown-tenant
+policy should count that toward their cardinality budget.
 
 ### `scg_rpcs_total{rpc, code}` — counter
 

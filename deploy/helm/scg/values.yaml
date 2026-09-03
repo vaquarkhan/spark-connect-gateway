@@ -58,9 +58,17 @@ probes:
   initialDelaySeconds: 5
   periodSeconds: 10
 
-# -- Backend discovery. `static` is the default; switch to `k8s` to
-#    have the gateway watch a Spark Connect Service's Endpoints object
-#    (the apache/spark-kubernetes-operator pattern).
+# -- Backend discovery for the *default* pool. `static` is the
+#    default; switch to `k8s` to have the gateway watch a Spark
+#    Connect Service's Endpoints object (the
+#    apache/spark-kubernetes-operator pattern).
+#
+#    May be set to `null` — but only when
+#    `tenantPools.onUnknownTenant: reject` is set with at least one
+#    override: in that strict multi-tenant mode the default pool is
+#    never selected (unmatched tenants are rejected before pool
+#    selection), so no discovery source is needed. The chart and the
+#    gateway binary both validate this rule.
 backendDiscovery:
   # `static` or `k8s`
   type: static
@@ -240,6 +248,38 @@ tenantPools:
   onUnknownTenant: use_default
   overrides: {}
 
+# Pre-shared token the gateway presents to backends (as
+# `authorization: Bearer <token>`) — for backend Spark Connect
+# servers started with `spark.connect.authenticate.token`
+# (Spark 4.0+). Holding the token only in the gateway is the
+# auth-layer half of the trust-boundary enforcement: a client that
+# bypasses the gateway is rejected by the backend itself with
+# UNAUTHENTICATED. (`backendNetworkPolicy` below is the network-layer
+# half; production should use both.)
+#
+# Tokens come from existing Kubernetes Secrets — the chart mounts
+# them into the pod as env vars, so the token never appears in the
+# rendered ConfigMap. The gateway reads them once at startup:
+# rotating a Secret requires a rollout restart (and a matching
+# restart of the backends). The default token applies to every pool;
+# a tenant listed in `tenantOverrides` presents its own token to its
+# own pool instead (the tenant should also appear in
+# `tenantPools.overrides`).
+backendToken:
+  enabled: false
+  # Existing Secret holding the default-pool token.
+  secretName: ""
+  secretKey: token
+  # tenant name → {secretName, secretKey} for pools with their own
+  # token. Tenant names are sanitised into env-var names
+  # (SCG_BACKEND_TOKEN_<TENANT>); two tenants that differ only in
+  # punctuation (team-a vs team_a) would collide — avoid that.
+  tenantOverrides: {}
+  # tenantOverrides:
+  #   team-a:
+  #     secretName: team-a-backend-token
+  #     secretKey: token
+
 # How the gateway figures out which tenant each inbound RPC belongs
 # to. The resolved tenant becomes the first segment of the routing
 # key, so two tenants with the same session_id stay isolated.
@@ -309,3 +349,27 @@ serviceAccount:
   # If empty, the helper derives one from release fullname.
   name: ""
   annotations: {}
+
+# Opt-in NetworkPolicy enforcing the gateway trust boundary: backend
+# Spark Connect servers only accept gRPC ingress from the gateway
+# pods. The gateway's auth and multi-tenancy guarantees hold only if
+# clients cannot reach the backends directly (the backend trusts
+# UserContext.user_id as presented), so production deployments should
+# enable this — or an equivalent policy — unless the boundary is
+# enforced some other way. Requires a CNI that enforces NetworkPolicy.
+backendNetworkPolicy:
+  enabled: false
+  # Namespace the backend pods run in. Empty = the release namespace.
+  namespace: ""
+  # Pod labels selecting the backend Spark Connect pods. Required
+  # when enabled — the backends are not chart-managed, so the chart
+  # cannot infer them.
+  backendPodLabels: {}
+  # The gRPC port the backends listen on.
+  grpcPort: 15002
+  # Extra ingress rules appended verbatim to the policy. Once a pod
+  # is selected by an Ingress policy, everything not whitelisted is
+  # denied — so whitelist any other legitimate ingress here, e.g.
+  # executor-to-driver traffic on operator-managed clusters, or
+  # Spark UI access. (Kubelet health probes are unaffected.)
+  additionalIngress: []

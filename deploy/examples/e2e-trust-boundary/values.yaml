@@ -1,0 +1,46 @@
+# Helm values for the trust-boundary E2E walkthrough. Same shape as
+# the e2e-smoke values (local image, single replica, memory affinity,
+# K8s Endpoints discovery, anonymous client auth) plus the one knob
+# this walkthrough is about: the gateway presents the pre-shared
+# backend token on every gateway→backend request. The backends
+# enforce that token (see spark-connect-server.yaml), so only the
+# gateway can talk to them.
+#
+# Client-side auth stays `none` to keep the walkthrough focused —
+# production would enable JWT/OIDC at the gateway *and* the backend
+# token behind it (see docs/deployment.md, "Enforcing the trust
+# boundary").
+
+image:
+  repository: scg
+  tag: e2e
+  pullPolicy: Never
+
+replicaCount: 1
+
+backendDiscovery:
+  type: k8s
+  k8s:
+    namespace: spark-connect
+    serviceName: spark-connect
+    port: 15002
+
+affinityStore:
+  type: memory
+
+redis:
+  enabled: false
+
+auth:
+  type: none
+
+# The gateway reads the same Secret the backend pods read; the token
+# never appears in the rendered ConfigMap.
+backendToken:
+  enabled: true
+  secretName: scg-backend-token
+  secretKey: token
+
+audit:
+  enabled: true
+  logSuccessfulRpcs: false

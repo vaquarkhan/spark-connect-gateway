@@ -1,11 +1,30 @@
+{{- /*
+  Endpoints-watch RBAC. The gateway's K8s discovery needs
+  get/list/watch on endpoints in every namespace it watches a
+  Service in. That set comes from two places: the (optional)
+  top-level backendDiscovery when its type is k8s, and every
+  tenantPools.overrides entry of type k8s. Collect the distinct
+  namespaces and emit one Role + RoleBinding pair per namespace.
+*/}}
+{{- $namespaces := dict }}
+{{- if .Values.backendDiscovery }}
 {{- if eq .Values.backendDiscovery.type "k8s" }}
+{{- $_ := set $namespaces .Values.backendDiscovery.k8s.namespace true }}
+{{- end }}
+{{- end }}
+{{- range $tenant, $disc := .Values.tenantPools.overrides }}
+{{- if eq $disc.type "k8s" }}
+{{- $_ := set $namespaces $disc.namespace true }}
+{{- end }}
+{{- end }}
+{{- range $ns, $unused := $namespaces }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "scg.fullname" . }}-endpoints-watcher
-  namespace: {{ .Values.backendDiscovery.k8s.namespace }}
+  name: {{ include "scg.fullname" $ }}-endpoints-watcher
+  namespace: {{ $ns }}
   labels:
-    {{- include "scg.gateway.labels" . | nindent 4 }}
+    {{- include "scg.gateway.labels" $ | nindent 4 }}
 rules:
   # The K8s pool watches the Service's Endpoints object via kube-rs
   # to track which Spark Connect pods are healthy. The standard
@@ -20,16 +39,17 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "scg.fullname" . }}-endpoints-watcher
-  namespace: {{ .Values.backendDiscovery.k8s.namespace }}
+  name: {{ include "scg.fullname" $ }}-endpoints-watcher
+  namespace: {{ $ns }}
   labels:
-    {{- include "scg.gateway.labels" . | nindent 4 }}
+    {{- include "scg.gateway.labels" $ | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "scg.fullname" . }}-endpoints-watcher
+  name: {{ include "scg.fullname" $ }}-endpoints-watcher
 subjects:
   - kind: ServiceAccount
-    name: {{ include "scg.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
+    name: {{ include "scg.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+---
 {{- end }}

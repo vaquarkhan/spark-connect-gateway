@@ -165,6 +165,27 @@ impl AuditLogger {
         );
     }
 
+    /// `config.redacted` — a client asked for a config key the
+    /// gateway refuses to relay (currently the backend's own
+    /// pre-shared token) and the value was stripped from the
+    /// response. Security-relevant on its own: a legitimate client
+    /// has no reason to read the gateway↔backend credential, so
+    /// these events are worth alerting on.
+    pub fn config_redacted(&self, rid: &str, tenant: &str, user_id: &str, key: &str) {
+        if !self.cfg.enabled {
+            return;
+        }
+        info!(
+            target: "scg::audit",
+            event = "config.redacted",
+            rid = %rid,
+            tenant = %tenant,
+            user_id = %user_id,
+            key = %key,
+            "config key withheld from client",
+        );
+    }
+
     /// `rpc.error` — a handler returned a non-OK Status. `code` is
     /// the canonical gRPC code name (e.g. `Unauthenticated`,
     /// `PermissionDenied`, `ResourceExhausted`). Cancelled and

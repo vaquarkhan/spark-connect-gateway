@@ -133,9 +133,10 @@ Each `tenant override pool ready` line corresponds to one entry
 in `tenantPools.overrides`. The watcher's `size:0` here reflects
 the pool *at construction time* — moments later the K8s watcher
 reports `count:1` for each pool once the Endpoints data arrives.
-(The default pool also gets a `pool ready` line; it points at
-`spark-connect-team-a` to satisfy the chart's required field but
-is unreachable under `onUnknownTenant: reject`.)
+(There is no default pool in this walkthrough: `backendDiscovery`
+is omitted, which is allowed under `onUnknownTenant: reject`
+because the default pool could never be selected anyway. The
+startup log notes this with `no default pool configured`.)
 
 ### 4. Save the JWT signer helper
 
@@ -412,12 +413,14 @@ kubectl logs -n spark-connect deploy/scg | grep "tenant_resolver: rejecting"
 so the same RPC can be pivoted across both views (audit pipeline
 for compliance / alerting, structured log for operator debugging).
 
-### `scg_backend_pool_size` shows `1`, not `3`
+### `scg_backend_pool_size` shows `0`, not `2`
 
 By design. The unlabelled `scg_backend_pool_size` gauge tracks
-only the **default pool**, intentionally — adding a `tenant`
-label would let untrusted tenant strings inflate Prometheus
-cardinality. Per-tenant pool sizes show up in the gateway log
+only the **default pool** — and this walkthrough has none
+(`backendDiscovery` is omitted under the reject policy), so the
+gauge reads `0`. Adding a `tenant` label instead would let
+untrusted tenant strings inflate Prometheus cardinality. Per-
+tenant pool sizes show up in the gateway log
 as `"k8s pool: backend list updated","count":N` lines, one per
 override pool, but not in the metrics endpoint. Comments in
 `crates/gateway/src/main.rs` explain the trade-off in more

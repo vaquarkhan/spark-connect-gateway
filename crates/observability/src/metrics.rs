@@ -8,10 +8,16 @@
 //!
 //! * `rpc` — fixed set of 12 Spark Connect RPC names. Bounded.
 //! * `code` — gRPC status codes ("OK", "Unauthenticated", …). ~16 values.
-//! * `reason` — auth failure reason. Small fixed set.
-//! * **No** `user_id`, `tenant`, `session_id` labels — those would
-//!   blow up cardinality. Per-user metrics belong in a logging
-//!   pipeline (Loki / Splunk), not in Prometheus.
+//! * `reason` / `scope` — small fixed enums.
+//! * `tenant` — appears **only** on the two rate-limit counters.
+//!   Cardinality is bounded by the tenant set the resolver admits
+//!   (operator-configured); deployments deriving tenants from token
+//!   claims under a permissive unknown-tenant policy should count
+//!   that toward their cardinality budget.
+//! * **Never** `user_id`, `session_id`, or `operation_id` labels —
+//!   those are unbounded and would blow up Prometheus. Per-user and
+//!   per-session observability belongs in logs, audit events, and
+//!   trace attributes, not in metric labels.
 
 use std::sync::Arc;
 

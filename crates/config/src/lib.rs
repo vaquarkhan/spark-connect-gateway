@@ -42,12 +42,27 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
-    #[error("config: must specify either `backends` or `backend_discovery`")]
+    #[error(
+        "config: must specify either `backends` or `backend_discovery` \
+         (omitting both is allowed only when \
+         `tenant_pools.on_unknown_tenant: reject` is set and at least \
+         one tenant override is configured)"
+    )]
     NoDiscoverySource,
     #[error("config: cannot specify both `backends` and `backend_discovery`")]
     ConflictingDiscovery,
     #[error("config: static backend list must contain at least one address")]
     EmptyStatic,
+    #[error("config: backend token env var {name} is not set")]
+    TokenEnvMissing { name: String },
+    #[error("config: read backend token file {path}: {source}")]
+    TokenFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("config: backend token resolved to an empty string")]
+    TokenEmpty,
 }
 
 /// One of the supported backend discovery sources.
@@ -62,6 +77,48 @@ pub enum BackendDiscovery {
         service_name: String,
         port: u16,
     },
+}
+
+/// Where a backend pre-shared token comes from. Backends started
+/// with `spark.connect.authenticate.token` (Spark 4.0+) require a
+/// matching `Bearer` credential on every request; the gateway
+/// presents it on the gateway→backend hop so that operators can
+/// hold the token *only* in the gateway and have the backend itself
+/// reject clients that try to bypass it.
+///
+/// `env` / `file` keep the token out of the YAML (and out of the
+/// ConfigMap the Helm chart renders it into); `inline` is for
+/// walkthroughs and tests.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendTokenSource {
+    Inline { token: String },
+    Env { name: String },
+    File { path: String },
+}
+
+impl BackendTokenSource {
+    /// Resolve the token value. Reads the env var / file once, at
+    /// startup — the backend's own token is fixed for the server's
+    /// lifetime, so rotation implies restarting both sides anyway.
+    pub fn resolve(&self) -> Result<String, ConfigError> {
+        let token = match self {
+            Self::Inline { token } => token.clone(),
+            Self::Env { name } => std::env::var(name)
+                .map_err(|_| ConfigError::TokenEnvMissing { name: name.clone() })?,
+            Self::File { path } => std::fs::read_to_string(path)
+                .map_err(|e| ConfigError::TokenFile {
+                    path: path.clone(),
+                    source: e,
+                })?
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        };
+        if token.is_empty() {
+            return Err(ConfigError::TokenEmpty);
+        }
+        Ok(token)
+    }
 }
 
 /// Authentication configuration. Defaults to `none` so an unset
@@ -366,13 +423,39 @@ pub struct TenantPoolsSettings {
     /// default pool to be different from what `backends:` /
     /// `backend_discovery:` provides, list it as an override too.
     #[serde(default)]
-    pub overrides: std::collections::HashMap<String, BackendDiscovery>,
+    pub overrides: std::collections::HashMap<String, TenantPoolConfig>,
     /// What to do when an inbound RPC has a tenant that's not in
     /// `overrides`. `use_default` (default) routes through the
     /// deployment's default pool; `reject` returns
     /// `PermissionDenied` to the client.
     #[serde(default = "default_unknown_tenant_policy")]
     pub on_unknown_tenant: UnknownTenantPolicySetting,
+}
+
+/// One tenant's pool configuration: a discovery source plus,
+/// optionally, its own backend token. The discovery fields sit at
+/// the same YAML level as `backend_token` (serde-flattened), so
+/// existing override entries keep parsing unchanged:
+///
+/// ```yaml
+/// tenant_pools:
+///   overrides:
+///     team-a:
+///       type: static
+///       addresses: ["a-1:15002"]
+///       backend_token:          # optional
+///         kind: env
+///         name: TEAM_A_BACKEND_TOKEN
+/// ```
+///
+/// A tenant override *without* `backend_token` inherits the
+/// top-level `backend_token` (if any).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantPoolConfig {
+    #[serde(flatten)]
+    pub discovery: BackendDiscovery,
+    #[serde(default)]
+    pub backend_token: Option<BackendTokenSource>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -577,6 +660,8 @@ struct RawConfig {
     #[serde(default)]
     backend_discovery: Option<BackendDiscovery>,
     #[serde(default)]
+    backend_token: Option<BackendTokenSource>,
+    #[serde(default)]
     auth: Option<AuthConfig>,
     /// Address for the admin / metrics HTTP server. `null` disables it.
     /// Default `0.0.0.0:9090`.
@@ -607,7 +692,19 @@ fn default_admin_addr_opt() -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
-    pub discovery: BackendDiscovery,
+    /// The default pool's discovery source. `None` is permitted only
+    /// under `tenant_pools.on_unknown_tenant: reject` with at least
+    /// one tenant override — in that mode the default pool is never
+    /// selected (unmatched tenants are rejected before pool
+    /// selection), so requiring a discovery source would force
+    /// operators to configure a pool that cannot receive traffic.
+    pub discovery: Option<BackendDiscovery>,
+    /// Pre-shared token the gateway presents (as `authorization:
+    /// Bearer <token>`) on every gateway→backend request. Applies to
+    /// all pools unless a tenant override carries its own
+    /// `backend_token`. `None` sends no credential — only safe when
+    /// the backends don't enforce `spark.connect.authenticate.token`.
+    pub backend_token: Option<BackendTokenSource>,
     pub auth: AuthConfig,
     /// `Some(addr)` to enable the admin HTTP server, `None` to skip it.
     pub admin_addr: Option<String>,
@@ -653,14 +750,28 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let tenant_pools = raw.tenant_pools.unwrap_or_default();
         let discovery = match (raw.backends, raw.backend_discovery) {
             (Some(_), Some(_)) => return Err(ConfigError::ConflictingDiscovery),
-            (None, None) => return Err(ConfigError::NoDiscoverySource),
+            (None, None) => {
+                // No default pool is acceptable only when routing can
+                // never select it: strict multi-tenant deployments
+                // where every admitted tenant has its own pool and
+                // everything else is rejected.
+                let strict = matches!(
+                    tenant_pools.on_unknown_tenant,
+                    UnknownTenantPolicySetting::Reject
+                ) && !tenant_pools.overrides.is_empty();
+                if !strict {
+                    return Err(ConfigError::NoDiscoverySource);
+                }
+                None
+            }
             (Some(addrs), None) => {
                 if addrs.is_empty() {
                     return Err(ConfigError::EmptyStatic);
                 }
-                BackendDiscovery::Static { addresses: addrs }
+                Some(BackendDiscovery::Static { addresses: addrs })
             }
             (None, Some(d)) => {
                 if let BackendDiscovery::Static { addresses } = &d {
@@ -668,7 +779,7 @@ impl Config {
                         return Err(ConfigError::EmptyStatic);
                     }
                 }
-                d
+                Some(d)
             }
         };
         let bind_addr = if raw.bind_addr.is_empty() {
@@ -679,6 +790,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             discovery,
+            backend_token: raw.backend_token,
             auth: raw.auth.unwrap_or_default(),
             admin_addr: raw.admin_addr.filter(|s| !s.is_empty()),
             tracing: raw.tracing,
@@ -686,7 +798,7 @@ impl Config {
             health_check: raw.health_check.unwrap_or_default(),
             shutdown: raw.shutdown.unwrap_or_default(),
             tenant_resolver: raw.tenant_resolver.unwrap_or_default(),
-            tenant_pools: raw.tenant_pools.unwrap_or_default(),
+            tenant_pools,
             rate_limit: raw.rate_limit.unwrap_or_default(),
             audit: raw.audit.unwrap_or_default(),
         })
@@ -716,7 +828,7 @@ backends:
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.bind_addr, ":15003");
         match c.discovery {
-            BackendDiscovery::Static { addresses } => {
+            Some(BackendDiscovery::Static { addresses }) => {
                 assert_eq!(addresses, vec!["127.0.0.1:15002"]);
             }
             other => panic!("expected Static, got {:?}", other),
@@ -734,7 +846,7 @@ backend_discovery:
         );
         let c = Config::load(f.path()).unwrap();
         match c.discovery {
-            BackendDiscovery::Static { addresses } => {
+            Some(BackendDiscovery::Static { addresses }) => {
                 assert_eq!(addresses, vec!["a:1", "b:2"]);
             }
             other => panic!("expected Static, got {:?}", other),
@@ -754,17 +866,77 @@ backend_discovery:
         );
         let c = Config::load(f.path()).unwrap();
         match c.discovery {
-            BackendDiscovery::K8s {
+            Some(BackendDiscovery::K8s {
                 namespace,
                 service_name,
                 port,
-            } => {
+            }) => {
                 assert_eq!(namespace, "spark-connect");
                 assert_eq!(service_name, "spark-connect");
                 assert_eq!(port, 15002);
             }
             other => panic!("expected K8s, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn omitted_discovery_allowed_under_reject_with_overrides() {
+        // Strict multi-tenant mode: every admitted tenant has its own
+        // pool, unknown tenants are rejected — the default pool would
+        // never be selected, so requiring one would be dead config.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: reject
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a:15002"]
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.discovery.is_none());
+        assert!(matches!(
+            c.tenant_pools.on_unknown_tenant,
+            UnknownTenantPolicySetting::Reject
+        ));
+        assert_eq!(c.tenant_pools.overrides.len(), 1);
+    }
+
+    #[test]
+    fn omitted_discovery_rejected_under_use_default() {
+        // With use_default (explicit or implicit), the default pool
+        // is reachable, so a discovery source is mandatory.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: use_default
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a:15002"]
+"#,
+        );
+        assert!(matches!(
+            Config::load(f.path()).unwrap_err(),
+            ConfigError::NoDiscoverySource
+        ));
+    }
+
+    #[test]
+    fn omitted_discovery_rejected_without_overrides() {
+        // reject + zero overrides would reject every RPC — that's a
+        // config mistake, not a deployment shape; fail loudly.
+        let f = write(
+            r#"
+tenant_pools:
+  on_unknown_tenant: reject
+"#,
+        );
+        assert!(matches!(
+            Config::load(f.path()).unwrap_err(),
+            ConfigError::NoDiscoverySource
+        ));
     }
 
     #[test]
@@ -1166,7 +1338,9 @@ tenant_pools:
             c.tenant_pools.on_unknown_tenant,
             UnknownTenantPolicySetting::Reject
         ));
-        match c.tenant_pools.overrides.get("team-a").unwrap() {
+        let team_a = c.tenant_pools.overrides.get("team-a").unwrap();
+        assert!(team_a.backend_token.is_none());
+        match &team_a.discovery {
             BackendDiscovery::Static { addresses } => {
                 assert_eq!(
                     addresses,
@@ -1175,7 +1349,7 @@ tenant_pools:
             }
             other => panic!("expected Static, got {:?}", other),
         }
-        match c.tenant_pools.overrides.get("team-b").unwrap() {
+        match &c.tenant_pools.overrides.get("team-b").unwrap().discovery {
             BackendDiscovery::K8s {
                 namespace,
                 service_name,
@@ -1187,6 +1361,112 @@ tenant_pools:
             }
             other => panic!("expected K8s, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn backend_token_defaults_to_none() {
+        let f = write("backends: [\"a:1\"]\n");
+        let c = Config::load(f.path()).unwrap();
+        assert!(c.backend_token.is_none());
+    }
+
+    #[test]
+    fn loads_inline_backend_token() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+backend_token:
+  kind: inline
+  token: "deadbeef"
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        let src = c.backend_token.expect("backend_token parsed");
+        assert_eq!(src.resolve().unwrap(), "deadbeef");
+    }
+
+    #[test]
+    fn loads_env_backend_token() {
+        let f = write(
+            r#"
+backends: ["a:1"]
+backend_token:
+  kind: env
+  name: SCG_TEST_BACKEND_TOKEN
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        let src = c.backend_token.expect("backend_token parsed");
+        assert!(matches!(
+            src.resolve().unwrap_err(),
+            ConfigError::TokenEnvMissing { .. }
+        ));
+        // Env-var manipulation is process-global; this test relies on
+        // the name being unique to it, so set/remove is safe even
+        // with the parallel test runner.
+        std::env::set_var("SCG_TEST_BACKEND_TOKEN", "from-env");
+        assert_eq!(src.resolve().unwrap(), "from-env");
+        std::env::remove_var("SCG_TEST_BACKEND_TOKEN");
+    }
+
+    #[test]
+    fn loads_file_backend_token_and_trims_newline() {
+        let tok = write("s3cr3t\n");
+        let f = write(&format!(
+            "backends: [\"a:1\"]\nbackend_token:\n  kind: file\n  path: \"{}\"\n",
+            tok.path().display()
+        ));
+        let c = Config::load(f.path()).unwrap();
+        let src = c.backend_token.expect("backend_token parsed");
+        assert_eq!(src.resolve().unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn empty_backend_token_rejected_at_resolve() {
+        let src = BackendTokenSource::Inline { token: "".into() };
+        assert!(matches!(
+            src.resolve().unwrap_err(),
+            ConfigError::TokenEmpty
+        ));
+    }
+
+    #[test]
+    fn tenant_override_can_carry_its_own_backend_token() {
+        // `backend_token` sits at the same level as the flattened
+        // discovery fields inside an override entry.
+        let f = write(
+            r#"
+backends: ["default:15002"]
+backend_token:
+  kind: inline
+  token: "default-token"
+tenant_pools:
+  overrides:
+    team-a:
+      type: static
+      addresses: ["a-1:15002"]
+      backend_token:
+        kind: inline
+        token: "team-a-token"
+    team-b:
+      type: static
+      addresses: ["b-1:15002"]
+"#,
+        );
+        let c = Config::load(f.path()).unwrap();
+        let a = c.tenant_pools.overrides.get("team-a").unwrap();
+        assert_eq!(
+            a.backend_token.as_ref().unwrap().resolve().unwrap(),
+            "team-a-token"
+        );
+        // team-b has no token of its own — inheritance of the
+        // top-level token happens at wiring time, not parse time.
+        let b = c.tenant_pools.overrides.get("team-b").unwrap();
+        assert!(b.backend_token.is_none());
+        assert!(matches!(
+            &b.discovery,
+            BackendDiscovery::Static { addresses } if addresses == &vec!["b-1:15002".to_string()]
+        ));
     }
 
     #[test]

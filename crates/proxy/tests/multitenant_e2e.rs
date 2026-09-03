@@ -47,7 +47,7 @@ use scg_observability::Metrics;
 use scg_pool_static::StaticPool;
 use scg_proxy::{Dialer, SparkConnectProxy};
 use scg_ratelimit::{BucketRate, LimiterObserver, RateLimiter, RejectScope, TenantLimits};
-use scg_routing::{AffinityStore, Pool, Router, TenantRouter, UnknownTenantPolicy};
+use scg_routing::{AffinityStore, PoolEntry, Router, TenantRouter, UnknownTenantPolicy};
 use scg_store_memory::MemoryStore;
 use scg_tenant::{OnMissing, TenantResolver, TenantResolverConfig, TenantSource};
 use tokio::net::TcpListener;
@@ -224,16 +224,16 @@ async fn spawn_rig(unknown_policy: UnknownTenantPolicy) -> Rig {
     let (be_b, kb) = spawn_backend("be-b").await;
     let (be_default, kd) = spawn_backend("be-default").await;
 
-    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    let mut tenants: HashMap<String, PoolEntry> = HashMap::new();
     tenants.insert(
         "team-a".into(),
-        Arc::new(StaticPool::new(vec![be_a]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_a]).unwrap())),
     );
     tenants.insert(
         "team-b".into(),
-        Arc::new(StaticPool::new(vec![be_b]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_b]).unwrap())),
     );
-    let default_pool: Arc<dyn Pool> = Arc::new(StaticPool::new(vec![be_default]).unwrap());
+    let default_pool = PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_default]).unwrap()));
     let tr = TenantRouter::new(tenants, Some(default_pool), unknown_policy);
 
     let metrics = Metrics::new().unwrap();
@@ -522,14 +522,14 @@ async fn unknown_tenant_token_rejected_under_reject_policy() {
     let (be_a, _ka) = spawn_backend("be-a").await;
     let (be_b, _kb) = spawn_backend("be-b").await;
 
-    let mut tenants: HashMap<String, Arc<dyn Pool>> = HashMap::new();
+    let mut tenants: HashMap<String, PoolEntry> = HashMap::new();
     tenants.insert(
         "team-a".into(),
-        Arc::new(StaticPool::new(vec![be_a]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_a]).unwrap())),
     );
     tenants.insert(
         "team-b".into(),
-        Arc::new(StaticPool::new(vec![be_b]).unwrap()),
+        PoolEntry::round_robin(Arc::new(StaticPool::new(vec![be_b]).unwrap())),
     );
     // No default pool + Reject policy + tenantless token = the gateway
     // must surface Unauthenticated (from the resolver) and never
